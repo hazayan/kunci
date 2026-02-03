@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["server", "client", "core", "dmcrypt", "fuzz"]
+default-members = ["server"]
+
+[workspace.dependencies]
+axum = "0.8.8"
+tokio = { version = "1.37", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+p256 = { version = "0.13", features = ["ecdh", "arithmetic", "ecdsa"] }
+p384 = { version = "0.13", features = ["ecdh", "arithmetic", "ecdsa"] }
+p521 = { version = "0.13", features = ["ecdh", "arithmetic", "ecdsa"] }
+elliptic-curve = { version = "0.13.5", features = ["ecdh", "arithmetic"] }
+aes-gcm = "0.10"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8.5"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+sha2 = "0.10"
+sha1 = "0.10"
+digest = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+dirs = "5.0"
+clap = { version = "4.5", features = ["derive"] }
+nix = "0.28"
+tempfile = "3.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+walkdir = "2.5.0"
+kunci-core = { path = "core" }
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+num-integer = "0.1"
+
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Kunci Developers"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/karpal/kunci"
+description = "Tang and Clevis implementation in Rust"
+readme = "README.md"
+keywords = ["tang", "clevis", "encryption", "key-management"]
+categories = ["cryptography", "network-programming"]

@@ -1,0 +1,57 @@
+[package]
+name = "kunci-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tang server implementation in Rust"
+readme.workspace = true
+keywords = ["tang", "server", "encryption", "key-management"]
+categories.workspace = true
+
+[dependencies]
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true, features = ["json"] }
+p256 = { workspace = true, optional = true }
+p384 = { workspace = true, optional = true }
+p521 = { workspace = true, optional = true }
+elliptic-curve = { workspace = true, optional = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+dirs = { workspace = true }
+clap = { workspace = true, optional = true, features = ["derive"] }
+nix = { workspace = true, optional = true, features = ["socket", "user", "fs"] }
+kunci-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["full"] }
+axum = { workspace = true }
+serde_json = { workspace = true }
+walkdir = { workspace = true }
+
+[features]
+default = ["full"]
+full = [
+    "axum",
+    "tokio",
+    "tracing-subscriber",
+    "p256",
+    "p384",
+    "p521",
+    "elliptic-curve",
+    "clap",
+    "nix",
+]

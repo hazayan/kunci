@@ -1,0 +1,105 @@
+#!/bin/sh
+
+# PROVIDE: kunci_zfs
+# REQUIRE: NETWORKING
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+
+# This script unlocks ZFS datasets encrypted with Kunci (Clevis/Tang).
+# Add the following to /etc/rc.conf to enable:
+# kunci_zfs_enable="YES"
+# kunci_zfs_datasets="pool/encrypted otherpool/root"
+# Optional: kunci_zfs_opts="--log-level debug --log-modules tang,zfs"
+
+. /etc/rc.subr
+
+name="kunci_zfs"
+rcvar="kunci_zfs_enable"
+start_cmd="kunci_zfs_start"
+stop_cmd=":"
+
+say()
+{
+    msg="$1"
+    for dev in /dev/console /dev/ttyu0 /dev/ttyu1 /dev/ttyU0 /dev/ttyv0; do
+        if [ -c "$dev" ]; then
+            printf "%s\n" "$msg" >"$dev"
+        fi
+    done
+    printf "%s\n" "$msg"
+}
+
+log()
+{
+    msg="$1"
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "no-time")"
+    say "KUNCI_ZFS ${ts} ${msg}"
+}
+
+kunci_zfs_start()
+{
+    if [ -z "$kunci_zfs_datasets" ]; then
+        log "WARN no datasets configured; set kunci_zfs_datasets in /etc/rc.conf"
+        return 0
+    fi
+
+    # Check if kunci binary exists
+    if ! command -v kunci >/dev/null 2>&1; then
+        log "ERROR kunci binary not found in PATH"
+        return 1
+    fi
+
+    # Wait for network to be ready (important for Tang/Remote pins)
+    # We'll try for up to 30 seconds
+    _wait_for_network() {
+        local i=0
+        while [ $i -lt 30 ]; do
+            # Try to ping a known server (Google DNS) or check interface
+            if ping -c 1 -t 2 8.8.8.8 >/dev/null 2>&1 || \
+               ifconfig | grep -q "inet[6]\? " 2>/dev/null; then
+                log "INFO network ready after ${i}s"
+                return 0
+            fi
+            log "INFO network not ready yet (${i}s)"
+            sleep 1
+            i=$((i + 1))
+        done
+        return 1
+    }
+
+    log "START datasets=${kunci_zfs_datasets} opts=${kunci_zfs_opts:-}"
+    log "Waiting for network..."
+    if ! _wait_for_network; then
+        log "WARN network not available after 30 seconds; continuing"
+    fi
+
+    # Process each dataset
+    for dataset in $kunci_zfs_datasets; do
+        log "UNLOCK dataset=${dataset}"
+        
+        # Check if dataset exists and is encrypted
+        if ! zfs list -H -o name "$dataset" >/dev/null 2>&1; then
+            log "WARN dataset missing: ${dataset}"
+            continue
+        fi
+
+        # Check if already loaded
+        keystatus="$(zfs get -H -o value keystatus "$dataset" 2>/dev/null || echo unknown)"
+        if [ "$keystatus" = "available" ]; then
+            log "INFO already unlocked: ${dataset}"
+            continue
+        fi
+        log "INFO keystatus=${keystatus}"
+
+        # Try to unlock with kunci
+        if kunci $kunci_zfs_opts zfs unlock --dataset "$dataset"; then
+            log "OK unlocked: ${dataset}"
+        else
+            log "ERROR unlock failed: ${dataset}"
+            # Continue with other datasets even if one fails
+        fi
+    done
+}
+
+load_rc_config $name
+run_rc_command "$1"

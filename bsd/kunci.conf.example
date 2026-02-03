@@ -1,0 +1,47 @@
+# Kunci configuration file for FreeBSD
+# This file can be placed at /usr/local/etc/kunci/kunci.conf or ~/.config/kunci/config
+
+# Default Tang server URL (used when no server specified on command line)
+# default_server = "http://tang.example.com"
+
+# Default timeout for network operations in seconds
+# timeout = 30
+
+# Core log level (trace|debug|info|warn|error)
+# log_level = "info"
+
+# Core log modules (comma-separated, e.g., "tang,zfs")
+# log_modules = "tang,zfs"
+
+# ZFS-specific settings
+[zfs]
+# Default property name for storing JWE (default: "kunci:jwe")
+# property = "kunci:jwe"
+
+# Whether to automatically load key after successful unlock (default: true)
+# auto_load_key = true
+
+# Network settings for Tang/Remote pins
+[network]
+# HTTP proxy (optional)
+# proxy = "http://proxy.example.com:8080"
+
+# Custom CA bundle path (optional)
+# ca_bundle = "/etc/ssl/cert.pem"
+
+# Disable SSL verification (not recommended for production)
+# insecure = false
+
+# Logging configuration
+[logging]
+# Log level: error, warn, info, debug, trace
+# level = "info"
+
+# Log file path (optional, logs to stderr if not specified)
+# file = "/var/log/kunci.log"
+
+# Maximum log file size in MB before rotation
+# max_size = 10
+
+# Number of rotated log files to keep
+# keep_files = 3

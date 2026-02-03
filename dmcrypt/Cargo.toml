@@ -1,0 +1,21 @@
+[package]
+name = "kunci-dmcrypt"
+version = "0.1.0"
+edition = "2024"
+
+# Build as a cdylib to be used as a C library
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+kunci-core = { path = "../core", features = ["full"] }
+
+[profile.release]
+lto = true
+opt-level = "z"
+
+[build-dependencies]
+bindgen = "0.72.1"
