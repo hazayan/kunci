@@ -1,0 +1,55 @@
+[package]
+name = "kunci-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Clevis client implementation in Rust"
+readme.workspace = true
+keywords = ["clevis", "client", "encryption", "tang", "key-management"]
+categories.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["full"] }
+clap = { workspace = true, optional = true, features = ["derive"] }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+p256 = { workspace = true, optional = true }
+p384 = { workspace = true, optional = true }
+p521 = { workspace = true, optional = true }
+elliptic-curve = { workspace = true, optional = true }
+kunci-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+walkdir = { workspace = true }
+
+[features]
+default = ["full"]
+full = [
+    "tracing-subscriber",
+    "reqwest",
+    "tokio",
+    "clap",
+    "p256",
+    "p384",
+    "p521",
+    "elliptic-curve",
+    "kunci-core/full",
+]
+tpm2 = ["kunci-core/tpm2"]

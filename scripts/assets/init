@@ -1,0 +1,351 @@
+#!/bin/sh
+
+say() {
+    msg="$1"
+    if [ -c /dev/console ]; then
+        printf "%s\n" "$msg" >/dev/console 2>/dev/null || true
+    fi
+    printf "%s\n" "$msg" 2>/dev/null || true
+}
+
+log() {
+    msg="$1"
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "no-time")"
+    say "MFSROOT ${ts} ${msg}"
+}
+
+step() {
+    log "STEP $1"
+}
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+set +e
+
+step "init start"
+log "UNAME $(uname -a 2>/dev/null || echo unknown)"
+
+step "mount base filesystems"
+mount -t devfs devfs /dev || log "WARN devfs mount failed"
+mount -u -o rw / || log "WARN remount / rw failed"
+mount -t procfs proc /proc || log "WARN procfs mount failed"
+mount -t tmpfs tmpfs /tmp || log "WARN tmpfs mount failed"
+mount -t tmpfs tmpfs /var || log "WARN tmpfs /var mount failed"
+mkdir -p /var/db /var/run /var/tmp /run 2>/dev/null || true
+
+step "load configuration"
+[ -f /etc/kunci/boot.conf ] && . /etc/kunci/boot.conf && log "BOOT_CONF_LOADED"
+[ -f /etc/rc.conf ] && . /etc/rc.conf && log "RC_CONF_LOADED"
+[ -f /etc/kunci/kunci_zfs.conf ] && . /etc/kunci/kunci_zfs.conf && log "KUNCI_ZFS_CONF_LOADED"
+log "BUILD ${KUNCI_BUILD_ID:-unknown}"
+
+if [ -z "${KUNCI_PIN_CONFIG:-}" ] && [ -f /etc/kunci/pin.json ]; then
+    KUNCI_PIN_CONFIG="/etc/kunci/pin.json"
+fi
+
+if [ -z "${KUNCI_DATASETS:-}" ] && [ -n "${kunci_zfs_datasets:-}" ]; then
+    KUNCI_DATASETS="${kunci_zfs_datasets}"
+fi
+
+if [ -z "${KUNCI_KUNCI_OPTS:-}" ] && [ -n "${kunci_zfs_opts:-}" ]; then
+    KUNCI_KUNCI_OPTS="${kunci_zfs_opts}"
+fi
+
+log "ENV KUNCI_PIN=${KUNCI_PIN:-} KUNCI_PIN_CONFIG=${KUNCI_PIN_CONFIG:-} KUNCI_NETIF=${KUNCI_NETIF:-} KUNCI_DATASETS=${KUNCI_DATASETS:-} KUNCI_ROOT_DATASET=${KUNCI_ROOT_DATASET:-}"
+
+if [ -z "${KUNCI_ROOT_DATASET:-}" ]; then
+    log "ERROR KUNCI_ROOT_DATASET is not set"
+    exit 1
+fi
+
+if [ -n "${KUNCI_PIN_CONFIG:-}" ] && [ ! -f "${KUNCI_PIN_CONFIG}" ]; then
+    log "ERROR pin config missing: ${KUNCI_PIN_CONFIG}"
+    exit 1
+fi
+
+pin_url=""
+if [ -n "${KUNCI_PIN_CONFIG:-}" ]; then
+    pin_url="$(awk -F'"' '/"url"[[:space:]]*:/ {print $4; exit}' "${KUNCI_PIN_CONFIG}")"
+    [ -n "${pin_url}" ] && log "INFO pin url ${pin_url}"
+fi
+
+export KUNCI_LOG=1
+export KUNCI_LOG_LEVEL=trace
+export KUNCI_LOG_MODULES=tang,zfs,crypto,jose,pin,remote,http
+export KUNCI_LOG_ARGS="--log-level trace --log-modules tang,zfs,crypto,jose,pin,remote,http"
+
+step "network"
+netifs="${KUNCI_NETIF:-$(ifconfig -l)}"
+log "NETIFS ${netifs}"
+for iface in ${netifs}; do
+    case "${iface}" in
+        lo*) continue ;;
+    esac
+    ifconfig "${iface}" up || continue
+    log "DHCP ${iface}"
+    mkdir -p /var/run /var/run/dhclient /var/db 2>/dev/null || true
+    dhclient_pid="/var/run/dhclient.${iface}.pid"
+    dhclient_lease="/var/db/dhclient.leases"
+    : > "${dhclient_pid}" 2>/dev/null || true
+    : > "${dhclient_lease}" 2>/dev/null || true
+    dhclient -b -p "${dhclient_pid}" -l "${dhclient_lease}" "${iface}" 2>&1 \
+        | while IFS= read -r line; do log "DHCLIENT ${iface} ${line}"; done || true
+    waited=0
+    lease_ip=""
+    while [ "${waited}" -lt 10 ]; do
+        lease_ip="$(ifconfig "${iface}" 2>/dev/null | awk '$1=="inet"{print $2; exit}')"
+        [ -n "${lease_ip}" ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if [ -n "${lease_ip}" ]; then
+        log "DHCP_LEASE ${iface} ${lease_ip}"
+    else
+        log "WARN dhclient lease empty for ${iface}"
+    fi
+    break
+done
+
+step "netcheck"
+if [ -n "${KUNCI_NETCHECK:-}" ] && [ -n "${pin_url:-}" ]; then
+    log "NETCHECK_START ${pin_url}"
+    if kunci-client -s "${pin_url}" ${KUNCI_LOG_ARGS} fetch-adv 2>&1; then
+        log "NETCHECK adv ok ${pin_url}/adv"
+    else
+        log "NETCHECK adv failed ${pin_url}/adv"
+    fi
+fi
+
+step "load zfs module"
+set -o pipefail
+if ! kldload -v /boot/kernel/zfs.ko 2>&1 \
+    | while IFS= read -r line; do log "KLDLOAD_ZFS ${line}"; done; then
+    log "ERROR kldload zfs.ko failed"
+    exec /bin/sh
+fi
+set +o pipefail
+
+step "import pool"
+case "${KUNCI_ROOT_DATASET}" in
+    */*) ROOT_POOL="${KUNCI_ROOT_DATASET%%/*}" ;;
+    *) ROOT_POOL="${KUNCI_ROOT_DATASET}" ;;
+esac
+if [ -z "${ROOT_POOL}" ]; then
+    log "ERROR empty root pool derived from ${KUNCI_ROOT_DATASET}"
+    exit 1
+fi
+set -o pipefail
+if ! zpool import -N "${ROOT_POOL}" 2>&1 \
+    | while IFS= read -r line; do log "ZPOOL_IMPORT ${line}"; done; then
+    log "ERROR zpool import -N ${ROOT_POOL} failed"
+    exec /bin/sh
+fi
+set +o pipefail
+
+step "unlock dataset"
+set -- zfs unlock --dataset "${KUNCI_ROOT_DATASET}"
+[ -n "${KUNCI_PIN:-}" ] && set -- "$@" --pin "${KUNCI_PIN}"
+[ -n "${KUNCI_PIN_CONFIG:-}" ] && set -- "$@" --config "${KUNCI_PIN_CONFIG}"
+log "KUNCI_UNLOCK_START ${KUNCI_ROOT_DATASET}"
+set -o pipefail
+kunci-client ${KUNCI_KUNCI_OPTS:-} ${KUNCI_LOG_ARGS} "$@" 2>&1 \
+    | while IFS= read -r line; do log "KUNCI_UNLOCK ${line}"; done
+kunci_status="$?"
+set +o pipefail
+if [ "${kunci_status}" -ne 0 ]; then
+    log "ERROR kunci unlock failed for ${KUNCI_ROOT_DATASET}"
+    exec /bin/sh
+fi
+
+step "mount new root"
+[ -d /newroot ] || mkdir -p /newroot 2>/dev/null || true
+
+mountpoint="$(zfs get -H -o value mountpoint "${KUNCI_ROOT_DATASET}" 2>/dev/null || echo "")"
+canmount="$(zfs get -H -o value canmount "${KUNCI_ROOT_DATASET}" 2>/dev/null || echo "")"
+log "ZFS_ROOT_PROPS mountpoint=${mountpoint} canmount=${canmount}"
+zfs get -H -o property,value mountpoint,canmount,keystatus,encryption,keyformat,readonly "${KUNCI_ROOT_DATASET}" 2>&1 \
+    | while IFS= read -r line; do log "ZFS_PROP ${line}"; done || log "WARN zfs get props failed"
+zfs list -H -o name,mountpoint,canmount 2>&1 \
+    | while IFS= read -r line; do log "ZFS_LIST ${line}"; done || log "WARN zfs list failed"
+zpool status "${ROOT_POOL}" 2>&1 \
+    | while IFS= read -r line; do log "ZPOOL_STATUS ${line}"; done || log "WARN zpool status failed"
+log "INFO canmount=noauto expected; mounting explicitly"
+
+mount_ok=0
+set -o pipefail
+if mount -t zfs "${KUNCI_ROOT_DATASET}" /newroot 2>&1 \
+    | while IFS= read -r line; do log "ZFS_MOUNT_ROOT_OUT ${line}"; done; then
+    mount_ok=1
+fi
+set +o pipefail
+
+if [ "${mount_ok}" -ne 1 ]; then
+    log "ERROR zfs mount ${KUNCI_ROOT_DATASET} failed"
+    exec /bin/sh
+fi
+
+log "STEP mount remaining datasets"
+zfs mount -a 2>&1
+mount -t devfs devfs /newroot/dev
+mount -t procfs proc /newroot/proc
+
+KUNCI_REROOT="${KUNCI_REROOT:-yes}"
+if [ "${KUNCI_REROOT}" = "yes" ]; then
+    reroot_marker="/newroot/etc/zjudo_reroot_done"
+    reroot_build="${KUNCI_BUILD_ID:-unknown}"
+    marker_value=""
+    if [ -f "${reroot_marker}" ]; then
+        marker_value="$(cat "${reroot_marker}" 2>/dev/null || true)"
+    fi
+    if [ -n "${marker_value}" ] && [ "${marker_value}" = "${reroot_build}" ]; then
+        log "INFO reroot already attempted for build ${marker_value}; skipping"
+    else
+        step "reroot to zfs root"
+        mkdir -p /newroot/etc 2>/dev/null || true
+        mkdir -p /newroot/etc/rc.d /newroot/etc/rc.conf.d 2>/dev/null || true
+        reroot_pending="/newroot/etc/zjudo_reroot_pending"
+        echo "${reroot_build}" >"${reroot_pending}" 2>/dev/null || true
+        if command -v kenv >/dev/null 2>&1; then
+            kenv vfs.root.mountfrom="zfs:${KUNCI_ROOT_DATASET}"
+            kenv vfs.root.mountfrom.options="rw"
+            kenv init_path="/sbin/init"
+            log "REROOT_ENV $(kenv vfs.root.mountfrom 2>/dev/null || echo unknown)"
+            log "REROOT_ENV $(kenv vfs.root.mountfrom.options 2>/dev/null || echo unknown)"
+            log "REROOT_ENV $(kenv init_path 2>/dev/null || echo unknown)"
+        else
+            log "WARN kenv not available; reroot may fail"
+        fi
+        if command -v id >/dev/null 2>&1; then
+            log "REROOT_ID uid=$(id -u 2>/dev/null || echo unknown) user=$(id -un 2>/dev/null || echo unknown)"
+        else
+            log "WARN id not available for reroot diagnostics"
+        fi
+        if command -v sysctl >/dev/null 2>&1; then
+            securelevel="$(sysctl -n kern.securelevel 2>/dev/null || echo unknown)"
+            log "REROOT_SYSCTL kern.securelevel=${securelevel}"
+            log "REROOT_SYSCTL security.bsd.see_other_uids=$(sysctl -n security.bsd.see_other_uids 2>/dev/null || echo unknown)"
+            log "REROOT_SYSCTL security.bsd.unprivileged_read_msgbuf=$(sysctl -n security.bsd.unprivileged_read_msgbuf 2>/dev/null || echo unknown)"
+        else
+            log "WARN sysctl not available for reroot diagnostics"
+        fi
+        log "REROOT defer to /etc/rc.d/zjudo_reroot in new root"
+        cat <<'EOF' >/newroot/etc/rc.d/zjudo_reroot
+#!/bin/sh
+#
+# PROVIDE: zjudo_reroot
+# REQUIRE: FILESYSTEMS
+# BEFORE: LOGIN
+
+. /etc/rc.subr
+
+name="zjudo_reroot"
+rcvar="zjudo_reroot_enable"
+start_cmd="${name}_start"
+stop_cmd=":"
+
+zjudo_reroot_start() {
+    pending="/etc/zjudo_reroot_pending"
+    done_marker="/etc/zjudo_reroot_done"
+    echo "zjudo: reroot script start" >/dev/console 2>/dev/null || true
+    echo "zjudo: reroot script start"
+    echo "started" >/etc/zjudo_reroot_ran 2>/dev/null || true
+    if [ ! -f "${pending}" ]; then
+        return 0
+    fi
+    build_id="$(cat "${pending}" 2>/dev/null || true)"
+    echo "zjudo: reroot pending build ${build_id}"
+    if [ -n "${build_id}" ] && [ -f "${done_marker}" ]; then
+        marker_value="$(cat "${done_marker}" 2>/dev/null || true)"
+        if [ "${marker_value}" = "${build_id}" ]; then
+            echo "zjudo: reroot already done for build ${build_id}"
+            return 0
+        fi
+    fi
+    echo "zjudo: reroot to zfs root (build ${build_id})"
+    if [ -n "${build_id}" ]; then
+        echo "${build_id}" >"${done_marker}" 2>/dev/null || true
+    fi
+    /sbin/reboot -r 2>&1 | while IFS= read -r line; do echo "zjudo: reroot ${line}"; done
+    reboot_status="$?"
+    echo "zjudo: reroot reboot -r returned status=${reboot_status}"
+    echo "zjudo: reroot reboot returned; attempting shutdown -r now"
+    /sbin/shutdown -r now 2>&1 | while IFS= read -r line; do echo "zjudo: reroot ${line}"; done
+    shutdown_status="$?"
+    echo "zjudo: reroot shutdown returned status=${shutdown_status}"
+    echo "zjudo: reroot failed or denied; blocking before login"
+    while true; do
+        sleep 5
+    done
+}
+
+load_rc_config "$name"
+: ${zjudo_reroot_enable:="YES"}
+run_rc_command "$1"
+EOF
+        chmod 555 /newroot/etc/rc.d/zjudo_reroot
+        if [ -f /newroot/etc/rc.d/zjudo_reroot ]; then
+            log "REROOT rc.d installed /newroot/etc/rc.d/zjudo_reroot"
+        else
+            log "ERROR failed to install /newroot/etc/rc.d/zjudo_reroot"
+        fi
+        cat <<'EOF' >/newroot/etc/rc.conf.d/zjudo_reroot
+zjudo_reroot_enable="YES"
+EOF
+        log "REROOT attempt reboot -r from mfsroot"
+        /sbin/reboot -r 2>&1 | while IFS= read -r line; do log "REROOT_CMD ${line}"; done
+        reboot_status="$?"
+        log "REROOT reboot -r returned status=${reboot_status}"
+        log "REROOT reboot returned; attempting shutdown -r now"
+        /sbin/shutdown -r now 2>&1 | while IFS= read -r line; do log "REROOT_CMD ${line}"; done
+        shutdown_status="$?"
+        log "REROOT shutdown returned status=${shutdown_status}"
+        log "REROOT failed or denied; blocking before login"
+        while true; do
+            sleep 5
+        done
+    fi
+fi
+
+step "stage mfsroot cleanup"
+mkdir -p /newroot/mfsroot /newroot/etc/rc.d /newroot/etc/rc.conf.d 2>/dev/null || true
+mount -t nullfs / /newroot/mfsroot 2>/dev/null || log "WARN nullfs mount /newroot/mfsroot failed"
+if [ ! -f /newroot/etc/rc.d/zjudo_mfsroot_cleanup ]; then
+    cat <<'EOF' >/newroot/etc/rc.d/zjudo_mfsroot_cleanup
+#!/bin/sh
+#
+# PROVIDE: zjudo_mfsroot_cleanup
+# REQUIRE: FILESYSTEMS
+# BEFORE: LOGIN
+
+. /etc/rc.subr
+
+name="zjudo_mfsroot_cleanup"
+rcvar="zjudo_mfsroot_cleanup_enable"
+start_cmd="${name}_start"
+stop_cmd=":"
+
+zjudo_mfsroot_cleanup_start() {
+    echo "zjudo: cleanup mfsroot"
+    if mount | grep -q ' /mfsroot '; then
+        umount -f /mfsroot
+    fi
+    if /sbin/mdconfig -l | grep -q '^md0$'; then
+        /sbin/mdconfig -d -u 0
+    fi
+}
+
+load_rc_config "$name"
+: ${zjudo_mfsroot_cleanup_enable:="NO"}
+run_rc_command "$1"
+EOF
+    chmod 555 /newroot/etc/rc.d/zjudo_mfsroot_cleanup
+fi
+if [ ! -f /newroot/etc/rc.conf.d/zjudo_mfsroot_cleanup ]; then
+    cat <<'EOF' >/newroot/etc/rc.conf.d/zjudo_mfsroot_cleanup
+zjudo_mfsroot_cleanup_enable="YES"
+EOF
+fi
+
+step "handoff"
+log "CHROOT /newroot /sbin/init (reroot pending)"
+exec chroot /newroot /sbin/init

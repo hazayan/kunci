@@ -1,0 +1,57 @@
+[package]
+name = "kunci-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+kunci-core = { path = "../core" }
+serde_json = "1.0"
+
+# Dependencies for fuzzing
+[dependencies.libfuzzer-sys]
+version = "0.4"
+
+[[bin]]
+name = "jwk_parse"
+path = "fuzz_targets/jwk_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "thumbprint"
+path = "fuzz_targets/thumbprint.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tang_advertisement"
+path = "fuzz_targets/tang_advertisement.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jws_payload"
+path = "fuzz_targets/jws_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "jwe_compact"
+path = "fuzz_targets/jwe_compact.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pin_config"
+path = "fuzz_targets/pin_config.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = true
+opt-level = 3
+codegen-units = 1
