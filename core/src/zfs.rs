@@ -13,6 +13,8 @@ use crate::pin::PinRegistry;
 
 /// ZFS property name for storing the Clevis JWE.
 const CLEVIS_PROPERTY: &str = "kunci:jwe";
+/// ZFS property name for storing the Clevis pin name.
+const CLEVIS_PIN_PROPERTY: &str = "kunci:pin";
 
 /// ZFS dataset encryption key length (32 bytes for AES-256-GCM).
 const ZFS_KEY_LEN: usize = 32;
@@ -85,8 +87,9 @@ pub fn bind_zfs(dataset: &str, pin_name: &str, pin_config: &Value) -> Result<Vec
     // Update the dataset key to the wrapping key so unlock succeeds later.
     change_zfs_key(dataset, &wrapping_key)?;
 
-    // Store the JWE as a ZFS property
+    // Store the JWE and pin name as ZFS properties
     set_zfs_property(dataset, CLEVIS_PROPERTY, jwe_compact)?;
+    set_zfs_property(dataset, CLEVIS_PIN_PROPERTY, pin_name)?;
 
     Ok(wrapping_key)
 }

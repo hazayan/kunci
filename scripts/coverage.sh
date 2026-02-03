@@ -22,8 +22,4 @@ cargo llvm-cov \
   -p kunci-core \
   -p kunci-server \
   -p kunci-client \
-  --features full \
-  --lcov \
-  --output-path "$OUT_FILE"
-
-echo "Coverage written to $OUT_FILE"
+  --features full
