@@ -396,14 +396,11 @@ async fn handle_admin_client(
     allowed_gid: u32,
     state: AppState,
 ) -> Result<()> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-
-    let creds = getsockopt(&stream, PeerCredentials)
-        .map_err(|e| kunci_core::Error::config(format!("Failed to read peer creds: {}", e)))?;
-    if creds.gid() != allowed_gid {
+    let peer_gid = peer_gid(&stream)?;
+    if peer_gid != allowed_gid {
         let response = AdminResponse::error(
             "ADMIN_FORBIDDEN",
-            format!("Peer GID {} not allowed", creds.gid()),
+            format!("Peer GID {} not allowed", peer_gid),
         );
         let bytes = serde_json::to_vec(&response)
             .map_err(|e| kunci_core::Error::config(format!("Admin response encode failed: {}", e)))?;
@@ -478,6 +475,51 @@ async fn handle_admin_client(
         .await
         .map_err(|e| kunci_core::Error::config(format!("Admin response write failed: {}", e)))?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn peer_gid(stream: &UnixStream) -> Result<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+    let creds = getsockopt(stream, PeerCredentials)
+        .map_err(|e| kunci_core::Error::config(format!("Failed to read peer creds: {}", e)))?;
+    Ok(creds.gid())
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos"
+))]
+fn peer_gid(stream: &UnixStream) -> Result<u32> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if rc != 0 {
+        return Err(kunci_core::Error::config(format!(
+            "Failed to read peer creds: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(gid as u32)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "macos"
+)))]
+fn peer_gid(_stream: &UnixStream) -> Result<u32> {
+    Err(kunci_core::Error::config(
+        "Peer credential lookup not supported on this platform",
+    ))
 }
 
 #[tokio::main]

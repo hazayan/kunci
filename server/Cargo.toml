@@ -32,6 +32,7 @@ pbkdf2 = { workspace = true }
 dirs = { workspace = true }
 clap = { workspace = true, optional = true, features = ["derive"] }
 nix = { workspace = true, optional = true, features = ["socket", "user", "fs"] }
+libc = { workspace = true, optional = true }
 kunci-core = { workspace = true }
 
 [dev-dependencies]
@@ -54,4 +55,5 @@ full = [
     "elliptic-curve",
     "clap",
     "nix",
+    "libc",
 ]
