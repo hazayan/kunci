@@ -71,7 +71,7 @@ pub fn bind_zfs(dataset: &str, pin_name: &str, pin_config: &Value) -> Result<Vec
 
     // Encrypt the wrapping key with the pin
     let jwe_value = pin.encrypt(pin_config, &wrapping_key)?;
-    
+
     // Extract JWE compact string from the result
     let jwe_compact = jwe_value
         .get("jwe")
@@ -105,7 +105,11 @@ pub fn bind_zfs(dataset: &str, pin_name: &str, pin_config: &Value) -> Result<Vec
 /// # Returns
 ///
 /// The decrypted wrapping key (32 bytes) that was loaded into ZFS.
-pub fn unlock_zfs(dataset: &str, pin_name: Option<&str>, pin_config: Option<&Value>) -> Result<Vec<u8>> {
+pub fn unlock_zfs(
+    dataset: &str,
+    pin_name: Option<&str>,
+    pin_config: Option<&Value>,
+) -> Result<Vec<u8>> {
     crate::klog!(
         module: "zfs",
         level: crate::log::LogLevel::Info,
@@ -125,33 +129,37 @@ pub fn unlock_zfs(dataset: &str, pin_name: Option<&str>, pin_config: Option<&Val
     );
 
     // Parse the JWE to extract the pin name if not provided
-    let (actual_pin_name, actual_pin_config) = if let (Some(name), Some(config)) = (pin_name, pin_config) {
-        (name.to_string(), config.clone())
-    } else {
-        // Extract from JWE protected header
-        let parts: Vec<&str> = jwe_compact.split('.').collect();
-        if parts.len() != 5 {
-            return Err(Error::crypto("Invalid JWE compact format".to_string()));
-        }
-        let header_b64 = parts[0];
-        let header_bytes = URL_SAFE_NO_PAD.decode(header_b64)
-            .map_err(|e| Error::crypto(format!("Failed to decode JWE header: {}", e)))?;
-        let header: Value = serde_json::from_slice(&header_bytes)
-            .map_err(|e| Error::crypto(format!("Failed to parse JWE header: {}", e)))?;
+    let (actual_pin_name, actual_pin_config) =
+        if let (Some(name), Some(config)) = (pin_name, pin_config) {
+            (name.to_string(), config.clone())
+        } else {
+            // Extract from JWE protected header
+            let parts: Vec<&str> = jwe_compact.split('.').collect();
+            if parts.len() != 5 {
+                return Err(Error::crypto("Invalid JWE compact format".to_string()));
+            }
+            let header_b64 = parts[0];
+            let header_bytes = URL_SAFE_NO_PAD
+                .decode(header_b64)
+                .map_err(|e| Error::crypto(format!("Failed to decode JWE header: {}", e)))?;
+            let header: Value = serde_json::from_slice(&header_bytes)
+                .map_err(|e| Error::crypto(format!("Failed to parse JWE header: {}", e)))?;
 
-        let clevis = header.get("clevis")
-            .ok_or_else(|| Error::crypto("Missing clevis node in JWE header".to_string()))?;
-        let pin_name = clevis.get("pin")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::crypto("Missing pin in clevis node".to_string()))?;
+            let clevis = header
+                .get("clevis")
+                .ok_or_else(|| Error::crypto("Missing clevis node in JWE header".to_string()))?;
+            let pin_name = clevis
+                .get("pin")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::crypto("Missing pin in clevis node".to_string()))?;
 
-        // Create a minimal config with just the clevis node
-        let config = serde_json::json!({
-            "clevis": clevis
-        });
+            // Create a minimal config with just the clevis node
+            let config = serde_json::json!({
+                "clevis": clevis
+            });
 
-        (pin_name.to_string(), config)
-    };
+            (pin_name.to_string(), config)
+        };
 
     crate::klog!(
         module: "zfs",
@@ -231,27 +239,27 @@ pub fn unbind_zfs(dataset: &str) -> Result<()> {
 /// A vector of ZFS dataset information.
 pub fn list_zfs() -> Result<Vec<ZfsDataset>> {
     let output = run_zfs_command(&["list", "-H", "-o", "name,encryption"])?;
-    
+
     let mut datasets = Vec::new();
     for line in output.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() != 2 {
             continue;
         }
-        
+
         let name = parts[0].to_string();
         let encryption = if parts[1] == "-" {
             None
         } else {
             Some(parts[1].to_string())
         };
-        
+
         // Check if the dataset is loaded (has key loaded)
         let loaded = is_dataset_loaded(&name)?;
-        
+
         // Get Clevis JWE if present
         let clevis_jwe = get_zfs_property(&name, CLEVIS_PROPERTY).ok().flatten();
-        
+
         datasets.push(ZfsDataset {
             name,
             loaded,
@@ -259,18 +267,38 @@ pub fn list_zfs() -> Result<Vec<ZfsDataset>> {
             clevis_jwe,
         });
     }
-    
+
     Ok(datasets)
 }
 
 #[cfg(test)]
 mod load_key_tests {
-    use super::load_zfs_key_args;
+    use super::{load_zfs_key_args, zfs_key_stdin_material, zfs_key_uses_text_lines, ZFS_KEY_LEN};
 
     #[test]
     fn test_load_zfs_key_args_uses_prompt() {
         let args = load_zfs_key_args("pool/root");
         assert_eq!(args, vec!["load-key", "-L", "prompt", "pool/root"]);
+    }
+
+    #[test]
+    fn raw_keys_are_written_as_exact_bytes() {
+        let key = vec![7u8; ZFS_KEY_LEN];
+        assert_eq!(zfs_key_stdin_material("raw", &key).unwrap(), key);
+        assert!(!zfs_key_uses_text_lines("raw"));
+    }
+
+    #[test]
+    fn hex_keys_are_written_as_hex_text() {
+        let key = [0xab, 0xcd];
+        assert_eq!(zfs_key_stdin_material("hex", &key).unwrap(), b"abcd");
+        assert!(zfs_key_uses_text_lines("hex"));
+    }
+
+    #[test]
+    fn raw_keys_must_be_wrapping_key_len() {
+        let err = zfs_key_stdin_material("raw", &[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("Raw ZFS keys must be 32 bytes"));
     }
 }
 
@@ -336,6 +364,45 @@ fn load_zfs_key_args(dataset: &str) -> Vec<String> {
         .collect()
 }
 
+fn change_zfs_key_args(dataset: &str, keyformat: &str) -> Vec<String> {
+    vec![
+        "change-key".to_string(),
+        "-o".to_string(),
+        "keylocation=prompt".to_string(),
+        "-o".to_string(),
+        format!("keyformat={}", keyformat),
+        dataset.to_string(),
+    ]
+}
+
+fn zfs_key_uses_text_lines(keyformat: &str) -> bool {
+    keyformat != "raw"
+}
+
+fn zfs_key_stdin_material(keyformat: &str, key: &[u8]) -> Result<Vec<u8>> {
+    match keyformat {
+        "passphrase" => match std::str::from_utf8(key) {
+            Ok(passphrase) => Ok(passphrase.as_bytes().to_vec()),
+            Err(_) => Ok(hex::encode(key).into_bytes()),
+        },
+        "hex" => Ok(hex::encode(key).into_bytes()),
+        "raw" => {
+            if key.len() != ZFS_KEY_LEN {
+                return Err(Error::crypto(format!(
+                    "Raw ZFS keys must be {} bytes, got {}",
+                    ZFS_KEY_LEN,
+                    key.len()
+                )));
+            }
+            Ok(key.to_vec())
+        }
+        other => Err(Error::crypto(format!(
+            "Unsupported ZFS keyformat '{}'",
+            other
+        ))),
+    }
+}
+
 fn change_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
     if !is_dataset_loaded(dataset)? {
         return Err(Error::crypto(format!(
@@ -344,75 +411,13 @@ fn change_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
         )));
     }
 
-    let keyformat = get_zfs_property(dataset, "keyformat")?
-        .unwrap_or_else(|| "passphrase".to_string());
+    let keyformat =
+        get_zfs_property(dataset, "keyformat")?.unwrap_or_else(|| "passphrase".to_string());
     eprintln!("KUNCI_CORE_ZFS_CHANGE_KEY_START {} {}", dataset, keyformat);
-
-    if keyformat != "passphrase" && keyformat != "hex" {
-        use std::io::Write;
-        use std::fs::{self, File};
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let mut path = std::env::temp_dir();
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|dur| dur.as_millis())
-            .unwrap_or(0);
-        path.push(format!("kunci-zfs-key-{}-{}.bin", std::process::id(), stamp));
-        let mut file = File::create(&path)
-            .map_err(|e| Error::crypto(format!("Failed to create temp key file: {}", e)))?;
-        file.write_all(key)
-            .map_err(|e| Error::crypto(format!("Failed to write raw key: {}", e)))?;
-        drop(file);
-        let keylocation = format!("keylocation=file://{}", path.display());
-        let child = Command::new("zfs")
-            .args([
-                "change-key",
-                "-o",
-                &keylocation,
-                "-o",
-                &format!("keyformat={}", keyformat),
-                dataset,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::crypto(format!("Failed to spawn zfs change-key: {}", e)))?;
-        eprintln!("KUNCI_CORE_ZFS_CHANGE_KEY_SPAWNED {}", dataset);
-        eprintln!("KUNCI_CORE_ZFS_CHANGE_KEY_WAIT_START {}", dataset);
-        let output = child
-            .wait_with_output()
-            .map_err(|e| Error::crypto(format!("Failed to wait for zfs change-key: {}", e)))?;
-        let _ = fs::remove_file(&path);
-        eprintln!(
-            "KUNCI_CORE_ZFS_CHANGE_KEY_WAIT_OK {} status={}",
-            dataset,
-            output.status
-        );
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!(
-                "KUNCI_CORE_ZFS_CHANGE_KEY_FAIL {} {}",
-                dataset,
-                stderr.trim()
-            );
-            return Err(Error::crypto(format!(
-                "Failed to change key: {}",
-                stderr.trim()
-            )));
-        }
-        return Ok(());
-    }
+    let material = zfs_key_stdin_material(&keyformat, key)?;
 
     let mut child = Command::new("zfs")
-        .args([
-            "change-key",
-            "-o",
-            "keylocation=prompt",
-            "-o",
-            &format!("keyformat={}", keyformat),
-            dataset,
-        ])
+        .args(change_zfs_key_args(dataset, &keyformat))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -426,38 +431,20 @@ fn change_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
         .ok_or_else(|| Error::crypto("Failed to get stdin for zfs change-key".to_string()))?;
     use std::io::Write;
 
-    let mut material: Vec<u8> = Vec::new();
-    match keyformat.as_str() {
-        "passphrase" => {
-            match std::str::from_utf8(key) {
-                Ok(passphrase) => {
-                    material.extend_from_slice(passphrase.as_bytes());
-                }
-                Err(_) => {
-                    let hex_key = hex::encode(key);
-                    material.extend_from_slice(hex_key.as_bytes());
-                }
-            }
-        }
-        "hex" => {
-            let hex_key = hex::encode(key);
-            material.extend_from_slice(hex_key.as_bytes());
-        }
-        _ => {}
-    }
-
     stdin
         .write_all(&material)
         .map_err(|e| Error::crypto(format!("Failed to write new key to zfs: {}", e)))?;
-    stdin
-        .write_all(b"\n")
-        .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
-    stdin
-        .write_all(&material)
-        .map_err(|e| Error::crypto(format!("Failed to write new key verify to zfs: {}", e)))?;
-    stdin
-        .write_all(b"\n")
-        .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
+    if zfs_key_uses_text_lines(&keyformat) {
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
+        stdin
+            .write_all(&material)
+            .map_err(|e| Error::crypto(format!("Failed to write new key verify to zfs: {}", e)))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
+    }
 
     stdin
         .flush()
@@ -469,8 +456,7 @@ fn change_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
         .map_err(|e| Error::crypto(format!("Failed to wait for zfs change-key: {}", e)))?;
     eprintln!(
         "KUNCI_CORE_ZFS_CHANGE_KEY_WAIT_OK {} status={}",
-        dataset,
-        output.status
+        dataset, output.status
     );
 
     if !output.status.success() {
@@ -491,13 +477,10 @@ fn change_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
 
 fn load_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
     let args = load_zfs_key_args(dataset);
-    let keyformat = get_zfs_property(dataset, "keyformat")?
-        .unwrap_or_else(|| "passphrase".to_string());
-    eprintln!(
-        "KUNCI_CORE_ZFS_LOAD_KEY_CMD {} {}",
-        dataset,
-        args.join(" ")
-    );
+    let keyformat =
+        get_zfs_property(dataset, "keyformat")?.unwrap_or_else(|| "passphrase".to_string());
+    let material = zfs_key_stdin_material(&keyformat, key)?;
+    eprintln!("KUNCI_CORE_ZFS_LOAD_KEY_CMD {} {}", dataset, args.join(" "));
     eprintln!("KUNCI_CORE_ZFS_LOAD_KEY_FORMAT {} {}", dataset, keyformat);
     let mut child = Command::new("zfs")
         .args(&args)
@@ -513,43 +496,13 @@ fn load_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
         .take()
         .ok_or_else(|| Error::crypto("Failed to get stdin for zfs".to_string()))?;
     use std::io::Write;
-    match keyformat.as_str() {
-        "passphrase" => {
-            match std::str::from_utf8(key) {
-                Ok(passphrase) => {
-                    stdin
-                        .write_all(passphrase.as_bytes())
-                        .map_err(|e| {
-                            Error::crypto(format!("Failed to write passphrase to zfs: {}", e))
-                        })?;
-                }
-                Err(_) => {
-                    let hex_key = hex::encode(key);
-                    stdin
-                        .write_all(hex_key.as_bytes())
-                        .map_err(|e| {
-                            Error::crypto(format!("Failed to write hex passphrase to zfs: {}", e))
-                        })?;
-                }
-            }
-            stdin
-                .write_all(b"\n")
-                .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
-        }
-        "hex" => {
-            let hex_key = hex::encode(key);
-            stdin
-                .write_all(hex_key.as_bytes())
-                .map_err(|e| Error::crypto(format!("Failed to write hex key to zfs: {}", e)))?;
-            stdin
-                .write_all(b"\n")
-                .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
-        }
-        _ => {
-            stdin
-                .write_all(key)
-                .map_err(|e| Error::crypto(format!("Failed to write key to zfs: {}", e)))?;
-        }
+    stdin
+        .write_all(&material)
+        .map_err(|e| Error::crypto(format!("Failed to write key to zfs: {}", e)))?;
+    if zfs_key_uses_text_lines(&keyformat) {
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| Error::crypto(format!("Failed to write newline to zfs: {}", e)))?;
     }
     stdin
         .flush()
@@ -561,8 +514,7 @@ fn load_zfs_key(dataset: &str, key: &[u8]) -> Result<()> {
         .map_err(|e| Error::crypto(format!("Failed to wait for zfs: {}", e)))?;
     eprintln!(
         "KUNCI_CORE_ZFS_LOAD_KEY_WAIT_OK {} status={}",
-        dataset,
-        output.status
+        dataset, output.status
     );
 
     if !output.status.success() {
