@@ -6,7 +6,7 @@
 use num_bigint::BigUint;
 use num_integer::Integer;
 use num_traits::{One, Zero, FromPrimitive};
-use rand::Rng;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -41,7 +41,7 @@ impl SssConfig {
             ));
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Generate a prime p of size key_bytes * 8 bits.
         // Note: We use a probabilistic prime generation, which is acceptable for this use case.
@@ -51,7 +51,7 @@ impl SssConfig {
         // e[0] is the secret (we generate it randomly, but in practice it will be provided by the user).
         let mut e = Vec::with_capacity(threshold);
         for _ in 0..threshold {
-            let coeff = rng.gen_range(BigUint::zero()..p.clone());
+            let coeff = random_biguint_below(&mut rng, &p);
             e.push(coeff);
         }
 
@@ -64,10 +64,10 @@ impl SssConfig {
     ///
     /// A byte vector containing x || y, each of size key_bytes (determined by the prime size).
     pub fn point(&self) -> Result<Vec<u8>> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Choose a random x in [0, p-1]
-        let x = rng.gen_range(BigUint::zero()..self.p.clone());
+        let x = random_biguint_below(&mut rng, &self.p);
 
         // Compute y = polynomial evaluated at x (mod p)
         let y = self.evaluate_polynomial(&x);
@@ -214,7 +214,7 @@ impl<R: Rng> GenPrime for R {
             // We generate a random number in the range [2^(bits-1), 2^bits - 1]
             let low = BigUint::from(1u32) << (bits - 1);
             let high = (BigUint::from(1u32) << bits) - 1u32;
-            let mut candidate = self.gen_range(low..=high);
+            let mut candidate = random_biguint_inclusive(self, &low, &high);
             // Ensure it's odd
             if candidate.is_even() {
                 candidate += 1u32;
@@ -250,9 +250,10 @@ fn is_prime(n: &BigUint, k: usize) -> bool {
         s += 1;
     }
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for _ in 0..k {
-        let a = rng.gen_range(two.clone()..n_minus_one.clone());
+        let upper = &n_minus_one - &one;
+        let a = random_biguint_inclusive(&mut rng, &two, &upper);
         let mut x = a.modpow(&d, n);
 
         if x == one || x == n_minus_one {
@@ -275,6 +276,45 @@ fn is_prime(n: &BigUint, k: usize) -> bool {
     }
 
     true
+}
+
+fn random_biguint_below<R: RngCore + ?Sized>(rng: &mut R, upper: &BigUint) -> BigUint {
+    if upper.is_zero() {
+        return BigUint::zero();
+    }
+
+    let bits = upper.bits() as usize;
+    let bytes_len = bits.div_ceil(8);
+    let top_mask = if bits % 8 == 0 {
+        0xff
+    } else {
+        (1u8 << (bits % 8)) - 1
+    };
+
+    loop {
+        let mut bytes = vec![0u8; bytes_len];
+        rng.fill_bytes(&mut bytes);
+        if let Some(first) = bytes.first_mut() {
+            *first &= top_mask;
+        }
+        let candidate = BigUint::from_bytes_be(&bytes);
+        if &candidate < upper {
+            return candidate;
+        }
+    }
+}
+
+fn random_biguint_inclusive<R: RngCore + ?Sized>(
+    rng: &mut R,
+    low: &BigUint,
+    high: &BigUint,
+) -> BigUint {
+    debug_assert!(low <= high);
+    if low == high {
+        return low.clone();
+    }
+    let span = high - low + 1u32;
+    low + random_biguint_below(rng, &span)
 }
 
 #[cfg(test)]
