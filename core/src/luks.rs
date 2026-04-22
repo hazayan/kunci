@@ -166,7 +166,7 @@ fn get_used_slots(device: &Path) -> Result<Vec<u32>> {
 fn generate_luks_key() -> Result<Vec<u8>> {
     use rand::RngCore;
     let mut key = vec![0u8; 40];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     Ok(key)
 }
 

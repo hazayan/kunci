@@ -37,7 +37,7 @@ reqwest = { workspace = true, optional = true }
 tss-esapi = { version = "7", optional = true }
 
 # Shamir's Secret Sharing dependencies
-num-bigint = { workspace = true, features = ["rand", "serde"] }
+num-bigint = { workspace = true, features = ["serde"] }
 num-traits = { workspace = true }
 num-integer = { workspace = true }
 

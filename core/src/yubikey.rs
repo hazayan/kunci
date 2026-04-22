@@ -229,14 +229,14 @@ impl Pin for YubikeyPin {
         
         // Generate random challenge (32 bytes)
         let mut challenge = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut challenge);
+        rand::rng().fill_bytes(&mut challenge);
         
         // Get response from Yubikey
         let response = challenge_response_all_yubikeys(cfg.slot, &challenge)?;
         
         // Generate random salt (32 bytes)
         let mut salt = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
         
         // Derive key using PBKDF2
         let iterations = 1000;

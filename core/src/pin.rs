@@ -247,7 +247,7 @@ impl Pin for SssPin {
 
         // Generate a random secret key (32 bytes)
         let mut secret_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret_key);
+        rand::rng().fill_bytes(&mut secret_key);
 
         // Create SSS configuration with 32-byte key and threshold t
         let sss_config = crate::sss::SssConfig::generate(32, t)
