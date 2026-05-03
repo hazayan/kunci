@@ -86,6 +86,30 @@ Admin commands (e.g., `show-keys`) use a local Unix socket and require the serve
 kunci-server --admin-sock /var/run/kunci-admin.sock --admin-gid <GID>
 ```
 
+The server can also load the same options from a JSON config file:
+
+```json
+{
+  "bind": "127.0.0.1",
+  "port": 8080,
+  "directory": "/var/db/tang",
+  "allow_tofu": false,
+  "admin_sock": "/var/run/kunci-admin.sock",
+  "admin_gid": 1000,
+  "log_level": "info",
+  "log_modules": "tang,zfs,remote",
+  "log_json": false
+}
+```
+
+Run it with:
+
+```
+kunci-server --config /etc/kunci/server.json
+```
+
+Command-line flags override values from the config file when both are provided. Boolean flags still work as plain flags, and can also be forced off with forms such as `--allow-tofu=false` or `--log-json=false`. Kebab-case field names such as `allow-tofu` and `admin-sock` are accepted as aliases for the underscore names.
+
 On the client:
 
 ```

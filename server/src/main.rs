@@ -16,10 +16,10 @@
 //! kunci-server --port 8080 --directory /var/db/tang
 //! ```
 
-use std::net::ToSocketAddrs;
-use std::path::PathBuf;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::{fs, net::ToSocketAddrs};
 
 use axum::{
     Json, Router,
@@ -36,30 +36,35 @@ use kunci_core::{
     admin::{AdminRequest, AdminResponse},
     tang::{RecoveryRequest, TangConfig, TangPolicy, TangServer},
 };
+use serde::Deserialize;
 use serde_json::json;
-use tracing::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tracing::info;
 
 /// Command-line arguments for the Tang server.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// JSON configuration file path
+    #[arg(short = 'c', long)]
+    config: Option<PathBuf>,
+
     /// Address to bind to (e.g., 127.0.0.1 or 0.0.0.0)
-    #[arg(short = 'b', long, default_value = "127.0.0.1")]
-    bind: String,
+    #[arg(short = 'b', long)]
+    bind: Option<String>,
 
     /// Port to listen on
-    #[arg(short, long, default_value = "8080")]
-    port: u16,
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Directory containing JWK files
-    #[arg(short, long, default_value = "/var/db/tang")]
-    directory: PathBuf,
+    #[arg(short, long)]
+    directory: Option<PathBuf>,
 
     /// Allow clients to request TOFU
-    #[arg(long)]
-    allow_tofu: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = false)]
+    allow_tofu: Option<bool>,
 
     /// Path to the local admin Unix socket (enables admin commands)
     #[arg(long)]
@@ -78,8 +83,144 @@ struct Args {
     log_modules: Option<String>,
 
     /// Emit JSON logs for server tracing output
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = false)]
+    log_json: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    bind: Option<String>,
+    port: Option<u16>,
+    directory: Option<PathBuf>,
+    #[serde(alias = "allow-tofu")]
+    allow_tofu: Option<bool>,
+    #[serde(alias = "admin-sock")]
+    admin_sock: Option<PathBuf>,
+    #[serde(alias = "admin-gid")]
+    admin_gid: Option<u32>,
+    #[serde(alias = "log-level")]
+    log_level: Option<String>,
+    #[serde(alias = "log-modules")]
+    log_modules: Option<String>,
+    #[serde(alias = "log-json")]
+    log_json: Option<bool>,
+}
+
+#[derive(Debug)]
+struct ServerConfig {
+    bind: String,
+    port: u16,
+    directory: PathBuf,
+    allow_tofu: bool,
+    admin_sock: Option<PathBuf>,
+    admin_gid: Option<u32>,
+    log_level: Option<String>,
+    log_modules: Option<String>,
     log_json: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1".to_string(),
+            port: 8080,
+            directory: PathBuf::from("/var/db/tang"),
+            allow_tofu: false,
+            admin_sock: None,
+            admin_gid: None,
+            log_level: None,
+            log_modules: None,
+            log_json: false,
+        }
+    }
+}
+
+impl ServerConfig {
+    fn from_args(args: &Args) -> Result<Self> {
+        let mut config = if let Some(path) = &args.config {
+            Self::from_file(path)?
+        } else {
+            Self::default()
+        };
+
+        if let Some(bind) = &args.bind {
+            config.bind = bind.clone();
+        }
+        if let Some(port) = args.port {
+            config.port = port;
+        }
+        if let Some(directory) = &args.directory {
+            config.directory = directory.clone();
+        }
+        if let Some(allow_tofu) = args.allow_tofu {
+            config.allow_tofu = allow_tofu;
+        }
+        if let Some(admin_sock) = &args.admin_sock {
+            config.admin_sock = Some(admin_sock.clone());
+        }
+        if let Some(admin_gid) = args.admin_gid {
+            config.admin_gid = Some(admin_gid);
+        }
+        if let Some(log_level) = &args.log_level {
+            config.log_level = Some(log_level.clone());
+        }
+        if let Some(log_modules) = &args.log_modules {
+            config.log_modules = Some(log_modules.clone());
+        }
+        if let Some(log_json) = args.log_json {
+            config.log_json = log_json;
+        }
+
+        Ok(config)
+    }
+
+    fn from_file(path: &FsPath) -> Result<Self> {
+        let content = fs::read_to_string(path).map_err(|e| {
+            kunci_core::Error::config(format!(
+                "Failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let file_config: FileConfig = serde_json::from_str(&content).map_err(|e| {
+            kunci_core::Error::config(format!(
+                "Failed to parse config file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        let mut config = Self::default();
+        if let Some(bind) = file_config.bind {
+            config.bind = bind;
+        }
+        if let Some(port) = file_config.port {
+            config.port = port;
+        }
+        if let Some(directory) = file_config.directory {
+            config.directory = directory;
+        }
+        if let Some(allow_tofu) = file_config.allow_tofu {
+            config.allow_tofu = allow_tofu;
+        }
+        if let Some(admin_sock) = file_config.admin_sock {
+            config.admin_sock = Some(admin_sock);
+        }
+        if let Some(admin_gid) = file_config.admin_gid {
+            config.admin_gid = Some(admin_gid);
+        }
+        if let Some(log_level) = file_config.log_level {
+            config.log_level = Some(log_level);
+        }
+        if let Some(log_modules) = file_config.log_modules {
+            config.log_modules = Some(log_modules);
+        }
+        if let Some(log_json) = file_config.log_json {
+            config.log_json = log_json;
+        }
+
+        Ok(config)
+    }
 }
 
 /// Server state shared across all handlers.
@@ -144,18 +285,24 @@ impl From<kunci_core::Error> for HttpError {
             kunci_core::Error::Http(_) => {
                 HttpError::with_code(StatusCode::BAD_GATEWAY, "HTTP_ERROR", err.to_string())
             }
-            kunci_core::Error::Config(_) => {
-                HttpError::with_code(StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR", err.to_string())
-            }
+            kunci_core::Error::Config(_) => HttpError::with_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CONFIG_ERROR",
+                err.to_string(),
+            ),
             kunci_core::Error::Network(_) => {
                 HttpError::with_code(StatusCode::BAD_GATEWAY, "NETWORK_ERROR", err.to_string())
             }
-            kunci_core::Error::External(_) => {
-                HttpError::with_code(StatusCode::INTERNAL_SERVER_ERROR, "EXTERNAL_ERROR", err.to_string())
-            }
-            kunci_core::Error::Crypto(_) => {
-                HttpError::with_code(StatusCode::INTERNAL_SERVER_ERROR, "CRYPTO_ERROR", err.to_string())
-            }
+            kunci_core::Error::External(_) => HttpError::with_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EXTERNAL_ERROR",
+                err.to_string(),
+            ),
+            kunci_core::Error::Crypto(_) => HttpError::with_code(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CRYPTO_ERROR",
+                err.to_string(),
+            ),
             _ => HttpError::internal_error(err.to_string()),
         }
     }
@@ -290,7 +437,9 @@ async fn post_recovery(
 }
 
 /// Handler for GET /policy
-async fn get_policy(State(state): State<AppState>) -> std::result::Result<impl IntoResponse, HttpError> {
+async fn get_policy(
+    State(state): State<AppState>,
+) -> std::result::Result<impl IntoResponse, HttpError> {
     let policy = TangPolicy {
         allow_tofu: state.tang_server.config().allow_tofu,
     };
@@ -359,9 +508,9 @@ const ADMIN_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 async fn run_admin_socket(path: PathBuf, allowed_gid: u32, state: AppState) -> Result<()> {
     if path.exists() {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|e| kunci_core::Error::config(format!("Failed to remove admin socket: {}", e)))?;
+        tokio::fs::remove_file(&path).await.map_err(|e| {
+            kunci_core::Error::config(format!("Failed to remove admin socket: {}", e))
+        })?;
     }
     let listener = UnixListener::bind(&path)
         .map_err(|e| kunci_core::Error::config(format!("Failed to bind admin socket: {}", e)))?;
@@ -370,8 +519,9 @@ async fn run_admin_socket(path: PathBuf, allowed_gid: u32, state: AppState) -> R
         .map_err(|e| kunci_core::Error::config(format!("Failed to stat admin socket: {}", e)))?
         .permissions();
     perms.set_mode(0o660);
-    std::fs::set_permissions(&path, perms)
-        .map_err(|e| kunci_core::Error::config(format!("Failed to set admin socket perms: {}", e)))?;
+    std::fs::set_permissions(&path, perms).map_err(|e| {
+        kunci_core::Error::config(format!("Failed to set admin socket perms: {}", e))
+    })?;
 
     let gid = nix::unistd::Gid::from_raw(allowed_gid);
     nix::unistd::chown(&path, None, Some(gid))
@@ -402,12 +552,12 @@ async fn handle_admin_client(
             "ADMIN_FORBIDDEN",
             format!("Peer GID {} not allowed", peer_gid),
         );
-        let bytes = serde_json::to_vec(&response)
-            .map_err(|e| kunci_core::Error::config(format!("Admin response encode failed: {}", e)))?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|e| kunci_core::Error::config(format!("Admin response write failed: {}", e)))?;
+        let bytes = serde_json::to_vec(&response).map_err(|e| {
+            kunci_core::Error::config(format!("Admin response encode failed: {}", e))
+        })?;
+        stream.write_all(&bytes).await.map_err(|e| {
+            kunci_core::Error::config(format!("Admin response write failed: {}", e))
+        })?;
         return Ok(());
     }
 
@@ -417,26 +567,21 @@ async fn handle_admin_client(
         .await
         .map_err(|e| kunci_core::Error::config(format!("Admin read failed: {}", e)))?;
     if buf.len() > ADMIN_MAX_REQUEST_BYTES {
-        let response = AdminResponse::error(
-            "ADMIN_REQUEST_TOO_LARGE",
-            "Admin request too large",
-        );
-        let bytes = serde_json::to_vec(&response)
-            .map_err(|e| kunci_core::Error::config(format!("Admin response encode failed: {}", e)))?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|e| kunci_core::Error::config(format!("Admin response write failed: {}", e)))?;
+        let response = AdminResponse::error("ADMIN_REQUEST_TOO_LARGE", "Admin request too large");
+        let bytes = serde_json::to_vec(&response).map_err(|e| {
+            kunci_core::Error::config(format!("Admin response encode failed: {}", e))
+        })?;
+        stream.write_all(&bytes).await.map_err(|e| {
+            kunci_core::Error::config(format!("Admin response write failed: {}", e))
+        })?;
         return Ok(());
     }
 
     let request: AdminRequest = match serde_json::from_slice(&buf) {
         Ok(req) => req,
         Err(_) => {
-            let response = AdminResponse::error(
-                "ADMIN_BAD_REQUEST",
-                "Failed to parse admin request",
-            );
+            let response =
+                AdminResponse::error("ADMIN_BAD_REQUEST", "Failed to parse admin request");
             let bytes = serde_json::to_vec(&response).map_err(|e| {
                 kunci_core::Error::config(format!("Admin response encode failed: {}", e))
             })?;
@@ -526,15 +671,16 @@ fn peer_gid(_stream: &UnixStream) -> Result<u32> {
 async fn main() -> Result<()> {
     // Parse command-line arguments
     let args = Args::parse();
+    let config = ServerConfig::from_args(&args)?;
 
     // Initialize logging
-    let tracing_level = args
+    let tracing_level = config
         .log_level
         .as_deref()
         .unwrap_or("info")
         .parse::<kunci_core::log::LogLevel>()
         .map_err(|e| kunci_core::Error::config(format!("Invalid --log-level: {}", e)))?;
-    let use_json = args.log_json || std::env::var_os("KUNCI_LOG_JSON").is_some();
+    let use_json = config.log_json || std::env::var_os("KUNCI_LOG_JSON").is_some();
     if use_json {
         tracing_subscriber::fmt()
             .with_max_level(map_tracing_level(tracing_level))
@@ -546,17 +692,17 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    init_core_logging(&args)?;
+    init_core_logging(&config)?;
 
     info!("Starting Kunci Tang server");
-    info!("Bind address: {}", args.bind);
-    info!("Port: {}", args.port);
-    info!("Key directory: {:?}", args.directory);
-    info!("Allow TOFU: {}", args.allow_tofu);
+    info!("Bind address: {}", config.bind);
+    info!("Port: {}", config.port);
+    info!("Key directory: {:?}", config.directory);
+    info!("Allow TOFU: {}", config.allow_tofu);
     // Create Tang server instance
-    let config = TangConfig::new(args.directory.to_string_lossy().into_owned())
-        .with_allow_tofu(args.allow_tofu);
-    let tang_server = TangServer::new(config)?;
+    let tang_config = TangConfig::new(config.directory.to_string_lossy().into_owned())
+        .with_allow_tofu(config.allow_tofu);
+    let tang_server = TangServer::new(tang_config)?;
     let exchange_keys: Vec<String> = tang_server
         .key_store()
         .keys
@@ -569,8 +715,8 @@ async fn main() -> Result<()> {
         tang_server: Arc::new(tang_server),
     };
 
-    if let Some(admin_sock) = args.admin_sock.clone() {
-        let admin_gid = args
+    if let Some(admin_sock) = config.admin_sock.clone() {
+        let admin_gid = config
             .admin_gid
             .ok_or_else(|| kunci_core::Error::config("Missing --admin-gid for admin socket"))?;
         let state_clone = state.clone();
@@ -587,12 +733,14 @@ async fn main() -> Result<()> {
     let router = create_router(state);
 
     // Resolve socket address (allows IPs or hostnames).
-    let bind_addr = format!("{}:{}", args.bind, args.port);
+    let bind_addr = format!("{}:{}", config.bind, config.port);
     let addr = bind_addr
         .to_socket_addrs()
         .map_err(|e| kunci_core::Error::config(format!("Failed to resolve {}: {}", bind_addr, e)))?
         .next()
-        .ok_or_else(|| kunci_core::Error::config(format!("No socket addresses for {}", bind_addr)))?;
+        .ok_or_else(|| {
+            kunci_core::Error::config(format!("No socket addresses for {}", bind_addr))
+        })?;
 
     info!("Server listening on {}", addr);
 
@@ -608,21 +756,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_core_logging(args: &Args) -> Result<()> {
+fn init_core_logging(config: &ServerConfig) -> Result<()> {
     use kunci_core::log::{LogConfig, LogLevel};
     use std::collections::HashSet;
 
-    if args.log_level.is_none() && args.log_modules.is_none() {
+    if config.log_level.is_none() && config.log_modules.is_none() {
         return Ok(());
     }
 
-    let level = args
+    let level = config
         .log_level
         .as_deref()
         .unwrap_or("info")
         .parse::<LogLevel>()
         .map_err(|e| kunci_core::Error::config(format!("Invalid --log-level: {}", e)))?;
-    let modules = args.log_modules.as_ref().map(|value| {
+    let modules = config.log_modules.as_ref().map(|value| {
         value
             .split(',')
             .map(|s| s.trim().to_string())
@@ -677,6 +825,130 @@ mod tests {
                 .unwrap_or(false),
             _ => false,
         }
+    }
+
+    #[test]
+    fn test_server_config_defaults() {
+        let args = Args::parse_from(["kunci-server"]);
+        let config = ServerConfig::from_args(&args).expect("config");
+
+        assert_eq!(config.bind, "127.0.0.1");
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.directory, PathBuf::from("/var/db/tang"));
+        assert!(!config.allow_tofu);
+        assert!(config.admin_sock.is_none());
+        assert!(config.admin_gid.is_none());
+        assert!(config.log_level.is_none());
+        assert!(config.log_modules.is_none());
+        assert!(!config.log_json);
+    }
+
+    #[test]
+    fn test_server_config_from_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("kunci-server.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "bind": "0.0.0.0",
+                "port": 7420,
+                "directory": "/tmp/kunci-keys",
+                "allow_tofu": true,
+                "admin_sock": "/run/kunci/admin.sock",
+                "admin_gid": 42,
+                "log_level": "debug",
+                "log_modules": "tang,zfs",
+                "log_json": true
+            }"#,
+        )
+        .expect("write config");
+
+        let args = Args::parse_from(["kunci-server", "--config", config_path.to_str().unwrap()]);
+        let config = ServerConfig::from_args(&args).expect("config");
+
+        assert_eq!(config.bind, "0.0.0.0");
+        assert_eq!(config.port, 7420);
+        assert_eq!(config.directory, PathBuf::from("/tmp/kunci-keys"));
+        assert!(config.allow_tofu);
+        assert_eq!(
+            config.admin_sock,
+            Some(PathBuf::from("/run/kunci/admin.sock"))
+        );
+        assert_eq!(config.admin_gid, Some(42));
+        assert_eq!(config.log_level.as_deref(), Some("debug"));
+        assert_eq!(config.log_modules.as_deref(), Some("tang,zfs"));
+        assert!(config.log_json);
+    }
+
+    #[test]
+    fn test_server_config_file_accepts_kebab_case() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("kunci-server.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "allow-tofu": true,
+                "admin-sock": "/run/kunci/admin.sock",
+                "admin-gid": 42,
+                "log-level": "trace",
+                "log-modules": "tang",
+                "log-json": true
+            }"#,
+        )
+        .expect("write config");
+
+        let args = Args::parse_from(["kunci-server", "--config", config_path.to_str().unwrap()]);
+        let config = ServerConfig::from_args(&args).expect("config");
+
+        assert!(config.allow_tofu);
+        assert_eq!(
+            config.admin_sock,
+            Some(PathBuf::from("/run/kunci/admin.sock"))
+        );
+        assert_eq!(config.admin_gid, Some(42));
+        assert_eq!(config.log_level.as_deref(), Some("trace"));
+        assert_eq!(config.log_modules.as_deref(), Some("tang"));
+        assert!(config.log_json);
+    }
+
+    #[test]
+    fn test_server_config_cli_overrides_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("kunci-server.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "bind": "0.0.0.0",
+                "port": 7420,
+                "directory": "/tmp/file-keys",
+                "log_level": "info"
+            }"#,
+        )
+        .expect("write config");
+
+        let args = Args::parse_from([
+            "kunci-server",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--bind",
+            "127.0.0.2",
+            "--port",
+            "9000",
+            "--directory",
+            "/tmp/cli-keys",
+            "--allow-tofu=false",
+            "--log-level",
+            "debug",
+            "--log-json=false",
+        ]);
+        let config = ServerConfig::from_args(&args).expect("config");
+
+        assert_eq!(config.bind, "127.0.0.2");
+        assert_eq!(config.port, 9000);
+        assert_eq!(config.directory, PathBuf::from("/tmp/cli-keys"));
+        assert!(!config.allow_tofu);
+        assert_eq!(config.log_level.as_deref(), Some("debug"));
+        assert!(!config.log_json);
     }
 
     async fn start_test_server() -> TestServer {
@@ -768,7 +1040,12 @@ mod tests {
 
         let client = Client::new();
         let url = format!("http://{}/rec/{}", server.addr, thumbprint);
-        let response = client.post(url).json(&request).send().await.expect("request");
+        let response = client
+            .post(url)
+            .json(&request)
+            .send()
+            .await
+            .expect("request");
         assert!(response.status().is_success());
 
         let payload: Value = response.json().await.expect("json");
@@ -789,7 +1066,9 @@ mod tests {
         let allowed_gid = nix::unistd::getgid().as_raw().saturating_add(1);
 
         let server_task = tokio::spawn(async move {
-            handle_admin_client(server, allowed_gid, state).await.unwrap();
+            handle_admin_client(server, allowed_gid, state)
+                .await
+                .unwrap();
         });
 
         let (mut read_half, _write_half) = client.into_split();
@@ -813,7 +1092,9 @@ mod tests {
         let allowed_gid = nix::unistd::getgid().as_raw();
 
         let server_task = tokio::spawn(async move {
-            handle_admin_client(server, allowed_gid, state).await.unwrap();
+            handle_admin_client(server, allowed_gid, state)
+                .await
+                .unwrap();
         });
 
         let request = AdminRequest::ShowKeys {
