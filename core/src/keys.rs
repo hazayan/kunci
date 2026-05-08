@@ -41,10 +41,18 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+#[cfg(feature = "full")]
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(feature = "full")]
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -57,6 +65,283 @@ const DEFAULT_THP_HASH: &str = "S256";
 
 /// Supported hash algorithms for thumbprints.
 const SUPPORTED_HASHES: &[&str] = &["S1", "S224", "S256", "S384", "S512"];
+
+const ENCRYPTED_BUNDLE_FILE: &str = "keystore.bundle.json";
+const ENCRYPTED_BUNDLE_KIND: &str = "kunci-server-keystore";
+const ENCRYPTED_BUNDLE_CIPHER: &str = "A256GCM";
+
+/// Server key storage backend.
+pub trait ServerKeyBackend {
+    /// Loads the server key store.
+    fn load(&self) -> Result<KeyStore>;
+
+    /// Creates server keys when the backend is empty.
+    fn create_if_empty(&self) -> Result<()>;
+}
+
+/// Plain filesystem backend using Tang-compatible JWK files.
+#[derive(Debug, Clone)]
+pub struct FilesystemKeyBackend {
+    directory: PathBuf,
+    auto_create: bool,
+}
+
+impl FilesystemKeyBackend {
+    /// Creates a filesystem backend for the given JWK directory.
+    pub fn new<P: Into<PathBuf>>(directory: P) -> Self {
+        Self {
+            directory: directory.into(),
+            auto_create: true,
+        }
+    }
+
+    /// Sets whether missing keys should be created automatically.
+    pub fn with_auto_create(mut self, auto_create: bool) -> Self {
+        self.auto_create = auto_create;
+        self
+    }
+
+    /// Returns the backend directory.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+impl ServerKeyBackend for FilesystemKeyBackend {
+    fn load(&self) -> Result<KeyStore> {
+        if self.auto_create {
+            KeyStore::load(&self.directory)
+        } else {
+            KeyStore::load_no_auto_create(&self.directory)
+        }
+    }
+
+    fn create_if_empty(&self) -> Result<()> {
+        if !self.directory.exists() {
+            fs::create_dir_all(&self.directory)?;
+        }
+        let store = KeyStore::load_keys(&self.directory)?;
+        if store.keys.is_empty() {
+            KeyStore::create_new_keys(&self.directory)?;
+        }
+        Ok(())
+    }
+}
+
+/// Provider for a 256-bit keystore wrapping key.
+pub trait WrappingKeyProvider {
+    /// Returns a 32-byte wrapping key.
+    fn wrapping_key(&self) -> Result<[u8; 32]>;
+}
+
+/// Test and migration helper wrapping key provider.
+#[derive(Debug, Clone)]
+pub struct StaticWrappingKeyProvider {
+    key: [u8; 32],
+}
+
+impl StaticWrappingKeyProvider {
+    /// Creates a provider from raw key bytes.
+    pub fn new(key: [u8; 32]) -> Self {
+        Self { key }
+    }
+}
+
+impl WrappingKeyProvider for StaticWrappingKeyProvider {
+    fn wrapping_key(&self) -> Result<[u8; 32]> {
+        Ok(self.key)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PlainKeyBundle {
+    version: u8,
+    keys: Vec<Jwk>,
+    rotated_keys: Vec<Jwk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EncryptedKeyBundle {
+    version: u8,
+    kind: String,
+    cipher: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+/// Encrypted filesystem bundle backend.
+#[cfg(feature = "full")]
+#[derive(Debug, Clone)]
+pub struct EncryptedBundleKeyBackend<P> {
+    directory: PathBuf,
+    key_provider: P,
+    auto_create: bool,
+}
+
+#[cfg(feature = "full")]
+impl<P> EncryptedBundleKeyBackend<P>
+where
+    P: WrappingKeyProvider,
+{
+    /// Creates an encrypted bundle backend for the given directory.
+    pub fn new<D: Into<PathBuf>>(directory: D, key_provider: P) -> Self {
+        Self {
+            directory: directory.into(),
+            key_provider,
+            auto_create: false,
+        }
+    }
+
+    /// Sets whether a missing encrypted bundle should be initialized.
+    pub fn with_auto_create(mut self, auto_create: bool) -> Self {
+        self.auto_create = auto_create;
+        self
+    }
+
+    /// Returns the encrypted bundle path.
+    pub fn bundle_path(&self) -> PathBuf {
+        self.directory.join(ENCRYPTED_BUNDLE_FILE)
+    }
+
+    /// Writes an encrypted bundle from an existing key store.
+    pub fn save_store(&self, store: &KeyStore) -> Result<()> {
+        if !self.directory.exists() {
+            fs::create_dir_all(&self.directory)?;
+        }
+
+        let plain = PlainKeyBundle {
+            version: 1,
+            keys: store.keys.clone(),
+            rotated_keys: store.rotated_keys.clone(),
+        };
+        let plaintext = serde_json::to_vec(&plain)
+            .map_err(|e| Error::config(format!("Failed to serialize key bundle: {}", e)))?;
+        let bundle = self.encrypt_bundle(&plaintext)?;
+        let json = serde_json::to_vec_pretty(&bundle)
+            .map_err(|e| Error::config(format!("Failed to serialize encrypted bundle: {}", e)))?;
+
+        let path = self.bundle_path();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o440);
+        fs::set_permissions(&path, perms)?;
+        Ok(())
+    }
+
+    /// Migrates a plaintext JWK directory into an encrypted bundle directory.
+    pub fn migrate_from_filesystem<S: AsRef<Path>>(&self, source_directory: S) -> Result<()> {
+        let store = KeyStore::load_no_auto_create(source_directory)?;
+        self.save_store(&store)
+    }
+
+    #[allow(deprecated)]
+    fn encrypt_bundle(&self, plaintext: &[u8]) -> Result<EncryptedKeyBundle> {
+        let key = self.key_provider.wrapping_key()?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| Error::crypto(format!("Invalid wrapping key: {}", e)))?;
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .map_err(|e| Error::crypto(format!("Failed to encrypt key bundle: {}", e)))?;
+
+        Ok(EncryptedKeyBundle {
+            version: 1,
+            kind: ENCRYPTED_BUNDLE_KIND.to_string(),
+            cipher: ENCRYPTED_BUNDLE_CIPHER.to_string(),
+            nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+        })
+    }
+
+    #[allow(deprecated)]
+    fn decrypt_bundle(&self, bundle: &EncryptedKeyBundle) -> Result<Vec<u8>> {
+        if bundle.version != 1 {
+            return Err(Error::config(format!(
+                "Unsupported encrypted key bundle version: {}",
+                bundle.version
+            )));
+        }
+        if bundle.kind != ENCRYPTED_BUNDLE_KIND {
+            return Err(Error::config(format!(
+                "Unsupported encrypted key bundle kind: {}",
+                bundle.kind
+            )));
+        }
+        if bundle.cipher != ENCRYPTED_BUNDLE_CIPHER {
+            return Err(Error::config(format!(
+                "Unsupported encrypted key bundle cipher: {}",
+                bundle.cipher
+            )));
+        }
+
+        let nonce = URL_SAFE_NO_PAD
+            .decode(&bundle.nonce)
+            .map_err(|e| Error::config(format!("Invalid key bundle nonce: {}", e)))?;
+        if nonce.len() != 12 {
+            return Err(Error::config("Invalid key bundle nonce length"));
+        }
+        let ciphertext = URL_SAFE_NO_PAD
+            .decode(&bundle.ciphertext)
+            .map_err(|e| Error::config(format!("Invalid key bundle ciphertext: {}", e)))?;
+        let key = self.key_provider.wrapping_key()?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| Error::crypto(format!("Invalid wrapping key: {}", e)))?;
+        cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|e| Error::crypto(format!("Failed to decrypt key bundle: {}", e)))
+    }
+}
+
+#[cfg(feature = "full")]
+impl<P> ServerKeyBackend for EncryptedBundleKeyBackend<P>
+where
+    P: WrappingKeyProvider,
+{
+    fn load(&self) -> Result<KeyStore> {
+        let path = self.bundle_path();
+        if !path.exists() {
+            if self.auto_create {
+                self.create_if_empty()?;
+            } else {
+                return Err(Error::config(format!(
+                    "Encrypted key bundle does not exist: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        let data = fs::read(&path)?;
+        let bundle: EncryptedKeyBundle = serde_json::from_slice(&data)
+            .map_err(|e| Error::config(format!("Failed to parse encrypted key bundle: {}", e)))?;
+        let plaintext = self.decrypt_bundle(&bundle)?;
+        let plain: PlainKeyBundle = serde_json::from_slice(&plaintext)
+            .map_err(|e| Error::config(format!("Failed to parse key bundle: {}", e)))?;
+        if plain.version != 1 {
+            return Err(Error::config(format!(
+                "Unsupported key bundle version: {}",
+                plain.version
+            )));
+        }
+        KeyStore::from_keys(plain.keys, plain.rotated_keys)
+    }
+
+    fn create_if_empty(&self) -> Result<()> {
+        let path = self.bundle_path();
+        if path.exists() {
+            return Ok(());
+        }
+        let store = KeyStore::generate_new()?;
+        self.save_store(&store)
+    }
+}
 
 /// A key store that manages Tang keys.
 #[derive(Debug, Clone)]
@@ -72,6 +357,28 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
+    /// Creates a key store from existing regular and rotated keys.
+    pub fn from_keys(keys: Vec<Jwk>, rotated_keys: Vec<Jwk>) -> Result<Self> {
+        let mut store = Self {
+            keys,
+            rotated_keys,
+            signing_keys: Vec::new(),
+            payload_keys: Vec::new(),
+        };
+        store.prepare_keys()?;
+        Ok(store)
+    }
+
+    /// Generates a fresh Tang key store in memory.
+    #[cfg(feature = "full")]
+    pub fn generate_new() -> Result<Self> {
+        let mut keys = Vec::new();
+        for alg in ["ES512", "ECMR"] {
+            keys.push(Self::generate_key(alg)?);
+        }
+        Self::from_keys(keys, Vec::new())
+    }
+
     /// Loads keys from the specified directory.
     ///
     /// If the directory doesn't exist or contains no keys, new signing and
@@ -513,7 +820,6 @@ impl KeyStore {
             .map_err(|e| Error::config(format!("Failed to create payload: {}", e)))
     }
 
-
     /// Returns the number of regular keys.
     pub fn key_count(&self) -> usize {
         self.keys.len()
@@ -640,6 +946,101 @@ mod tests {
         assert_eq!(store.signing_key_count(), 1); // Only ES512 can sign
         assert!(store.signing_keys[0].is_private());
         assert!(store.payload_keys.iter().all(|key| !key.is_private()));
+    }
+
+    #[test]
+    #[cfg(feature = "full")]
+    fn test_filesystem_backend_loads_default_key_store() {
+        let tempdir = TempDir::new().unwrap();
+        let backend = FilesystemKeyBackend::new(tempdir.path());
+        let store = backend.load().unwrap();
+
+        assert_eq!(store.key_count(), 2);
+        assert_eq!(store.signing_key_count(), 1);
+        assert!(backend.directory().exists());
+    }
+
+    #[test]
+    #[cfg(feature = "full")]
+    fn test_encrypted_bundle_roundtrip() {
+        let source_dir = TempDir::new().unwrap();
+        let bundle_dir = TempDir::new().unwrap();
+        let source = KeyStore::load(source_dir.path()).unwrap();
+        let backend = EncryptedBundleKeyBackend::new(
+            bundle_dir.path(),
+            StaticWrappingKeyProvider::new([7; 32]),
+        );
+
+        backend.save_store(&source).unwrap();
+        let loaded = backend.load().unwrap();
+
+        assert_eq!(loaded.key_count(), source.key_count());
+        assert_eq!(loaded.rotated_key_count(), source.rotated_key_count());
+        assert_eq!(loaded.signing_key_count(), source.signing_key_count());
+        assert!(loaded.signing_keys[0].is_private());
+        assert!(backend.bundle_path().exists());
+        assert_eq!(
+            std::fs::read_dir(bundle_dir.path()).unwrap().count(),
+            1,
+            "encrypted backend should store a bundle, not plaintext JWK files"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "full")]
+    fn test_encrypted_bundle_rejects_wrong_wrapping_key() {
+        let source_dir = TempDir::new().unwrap();
+        let bundle_dir = TempDir::new().unwrap();
+        let source = KeyStore::load(source_dir.path()).unwrap();
+        let backend = EncryptedBundleKeyBackend::new(
+            bundle_dir.path(),
+            StaticWrappingKeyProvider::new([7; 32]),
+        );
+        backend.save_store(&source).unwrap();
+
+        let wrong_backend = EncryptedBundleKeyBackend::new(
+            bundle_dir.path(),
+            StaticWrappingKeyProvider::new([8; 32]),
+        );
+        let err = wrong_backend.load().unwrap_err();
+
+        assert!(err.to_string().contains("Failed to decrypt key bundle"));
+    }
+
+    #[test]
+    #[cfg(feature = "full")]
+    fn test_encrypted_bundle_migrates_from_filesystem() {
+        let source_dir = TempDir::new().unwrap();
+        let bundle_dir = TempDir::new().unwrap();
+        let source = KeyStore::load(source_dir.path()).unwrap();
+        let backend = EncryptedBundleKeyBackend::new(
+            bundle_dir.path(),
+            StaticWrappingKeyProvider::new([9; 32]),
+        );
+
+        backend.migrate_from_filesystem(source_dir.path()).unwrap();
+        let loaded = backend.load().unwrap();
+
+        assert_eq!(loaded.key_count(), source.key_count());
+        assert_eq!(loaded.signing_key_count(), source.signing_key_count());
+        assert!(backend.bundle_path().exists());
+    }
+
+    #[test]
+    #[cfg(feature = "full")]
+    fn test_encrypted_bundle_auto_create_initializes_bundle() {
+        let bundle_dir = TempDir::new().unwrap();
+        let backend = EncryptedBundleKeyBackend::new(
+            bundle_dir.path(),
+            StaticWrappingKeyProvider::new([10; 32]),
+        )
+        .with_auto_create(true);
+
+        let loaded = backend.load().unwrap();
+
+        assert_eq!(loaded.key_count(), 2);
+        assert_eq!(loaded.signing_key_count(), 1);
+        assert!(backend.bundle_path().exists());
     }
 
     #[test]

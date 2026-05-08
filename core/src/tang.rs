@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::jose;
 use crate::jwk::{Jwk, JwkSet};
-use crate::keys::KeyStore;
+use crate::keys::{FilesystemKeyBackend, KeyStore, ServerKeyBackend};
 
 /// Tang advertisement response.
 ///
@@ -378,12 +378,9 @@ impl TangServer {
             jwk_dir = config.jwk_dir.as_str(),
             auto_create_keys = config.auto_create_keys
         );
-        let key_store = if config.auto_create_keys {
-            KeyStore::load(&config.jwk_dir)?
-        } else {
-            // Load keys without auto-creation
-            KeyStore::load_no_auto_create(&config.jwk_dir)?
-        };
+        let backend = FilesystemKeyBackend::new(&config.jwk_dir)
+            .with_auto_create(config.auto_create_keys);
+        let key_store = backend.load()?;
 
         Ok(Self { config, key_store })
     }

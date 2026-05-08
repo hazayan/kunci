@@ -1,0 +1,4 @@
+[00001] [2026-05-05T16:50:36Z] [PLANNING] Documented server-side FIDO2 wrapped keystore direction for kunci-server keys and clarified that it protects Tang JWKs at rest rather than replacing Tang private-key operations.
+[00002] [2026-05-05T16:55:00Z] [PLANNING] Extended the FIDO2 keystore plan with an admin-side encrypted backup and restore flow using the local admin socket and a FIDO2-locked backup artifact.
+[00003] [2026-05-08T14:41:17Z] [IMPLEMENTATION] Started the encrypted server keystore milestone by adding Beads tracking, a server key backend abstraction, and an AES-256-GCM encrypted bundle backend with a static test wrapping-key provider.
+[00004] [2026-05-08T14:44:54Z] [TEST] Validated the encrypted bundle backend with kunci-core and kunci-server tests, including round-trip load, wrong wrapping-key rejection, plaintext filesystem migration, and automatic encrypted bundle initialization.
