@@ -164,3 +164,24 @@ kunci-server key unlock-test \
   --directory /var/db/tang \
   --wrapping-key-file /etc/kunci/server-wrap.key
 ```
+
+Encrypted admin backup and restore:
+
+```sh
+kunci backup-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend raw-file \
+  --wrapping-key-file /etc/kunci/backup-wrap.key \
+  --output tang-keys.kunci-backup
+
+kunci-server key restore \
+  --input tang-keys.kunci-backup \
+  --directory /var/db/tang-restored \
+  --wrapping-key-file /etc/kunci/server-wrap.key
+```
+
+The admin backup command asks the running server to encrypt its in-memory key
+store and returns only the encrypted backup artifact over the admin socket. The
+artifact does not expose plaintext JWK material to the client. For this
+milestone, `raw-file` is the only backup wrapping backend; FIDO2 wrapping will
+replace it once the server has a hardware-backed wrapping-key provider.

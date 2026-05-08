@@ -121,6 +121,8 @@ enum KeyCommands {
     Migrate(KeyMigrateArgs),
     /// Validate that a key backend can be unlocked and loaded.
     UnlockTest(KeyCommandArgs),
+    /// Restore a key backend from an encrypted backup artifact.
+    Restore(KeyRestoreArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -157,6 +159,21 @@ struct KeyMigrateArgs {
     directory: Option<PathBuf>,
 
     /// Raw 32-byte wrapping key file for encrypted-bundle backend
+    #[arg(long)]
+    wrapping_key_file: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct KeyRestoreArgs {
+    /// Backup artifact to restore.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Destination key directory or encrypted bundle directory.
+    #[arg(long)]
+    directory: Option<PathBuf>,
+
+    /// Raw 32-byte wrapping key file for encrypted-bundle backend.
     #[arg(long)]
     wrapping_key_file: Option<PathBuf>,
 }
@@ -639,6 +656,21 @@ fn encrypted_bundle_backend(
     )
 }
 
+fn encrypted_backup_artifact(
+    tang_server: &TangServer,
+    backend: &str,
+    wrapping_key_file: &FsPath,
+) -> Result<Vec<u8>> {
+    if backend != "raw-file" {
+        return Err(kunci_core::Error::config(format!(
+            "Unsupported backup backend: {}",
+            backend
+        )));
+    }
+    let backend = encrypted_bundle_backend(FsPath::new("."), wrapping_key_file);
+    backend.backup_store(tang_server.key_store())
+}
+
 fn load_tang_server(config: &ServerConfig) -> Result<TangServer> {
     let tang_config = TangConfig::new(config.directory.to_string_lossy().into_owned())
         .with_allow_tofu(config.allow_tofu);
@@ -693,6 +725,7 @@ fn run_key_command(base_config: &ServerConfig, command: &KeyCommands) -> Result<
             Ok(())
         }
         KeyCommands::Migrate(args) => run_key_migrate(base_config, args),
+        KeyCommands::Restore(args) => run_key_restore(base_config, args),
     }
 }
 
@@ -737,6 +770,35 @@ fn run_key_migrate(base_config: &ServerConfig, args: &KeyMigrateArgs) -> Result<
     println!(
         "migrated filesystem keys from {} to encrypted bundle at {}",
         args.source_directory.display(),
+        directory.display()
+    );
+    Ok(())
+}
+
+fn run_key_restore(base_config: &ServerConfig, args: &KeyRestoreArgs) -> Result<()> {
+    let directory = args
+        .directory
+        .clone()
+        .unwrap_or_else(|| base_config.directory.clone());
+    let wrapping_key_file = args
+        .wrapping_key_file
+        .as_deref()
+        .or(base_config.wrapping_key_file.as_deref())
+        .ok_or_else(|| {
+            kunci_core::Error::config("Missing --wrapping-key-file for encrypted-bundle restore")
+        })?;
+    let artifact = fs::read(&args.input).map_err(|e| {
+        kunci_core::Error::config(format!(
+            "Failed to read backup artifact {}: {}",
+            args.input.display(),
+            e
+        ))
+    })?;
+    let backend = encrypted_bundle_backend(&directory, wrapping_key_file);
+    backend.restore_backup_to_bundle(&artifact)?;
+    println!(
+        "restored encrypted backup {} to encrypted bundle at {}",
+        args.input.display(),
         directory.display()
     );
     Ok(())
@@ -849,6 +911,17 @@ async fn handle_admin_client(
                 ),
             }
         }
+        AdminRequest::BackupKeys {
+            backend,
+            wrapping_key_file,
+        } => match encrypted_backup_artifact(
+            &state.tang_server,
+            &backend,
+            FsPath::new(&wrapping_key_file),
+        ) {
+            Ok(artifact) => AdminResponse::ok_backup(artifact),
+            Err(err) => AdminResponse::error("ADMIN_BACKUP_FAILED", err.to_string()),
+        },
     };
 
     let bytes = serde_json::to_vec(&response)
@@ -1224,7 +1297,9 @@ mod tests {
         let plaintext_dir = tempfile::tempdir().expect("plaintext dir");
         let bundle_dir = tempfile::tempdir().expect("bundle dir");
         let migrated_dir = tempfile::tempdir().expect("migrated dir");
+        let restored_dir = tempfile::tempdir().expect("restored dir");
         let key_file = tempfile::NamedTempFile::new().expect("key file");
+        let backup_file = tempfile::NamedTempFile::new().expect("backup file");
         std::fs::write(key_file.path(), [42u8; 32]).expect("write key");
 
         let base = ServerConfig::default();
@@ -1254,6 +1329,20 @@ mod tests {
         };
         run_key_command(&base, &KeyCommands::Migrate(migrate)).expect("migrate keys");
         assert!(migrated_dir.path().join("keystore.bundle.json").exists());
+
+        let migrated_backend = encrypted_bundle_backend(migrated_dir.path(), key_file.path());
+        let migrated_store = migrated_backend.load().expect("load migrated store");
+        let backup = migrated_backend
+            .backup_store(&migrated_store)
+            .expect("backup store");
+        std::fs::write(backup_file.path(), backup).expect("write backup");
+        let restore = KeyRestoreArgs {
+            input: backup_file.path().to_path_buf(),
+            directory: Some(restored_dir.path().to_path_buf()),
+            wrapping_key_file: Some(key_file.path().to_path_buf()),
+        };
+        run_key_command(&base, &KeyCommands::Restore(restore)).expect("restore backup");
+        assert!(restored_dir.path().join("keystore.bundle.json").exists());
     }
 
     #[test]
@@ -1441,6 +1530,53 @@ mod tests {
         let response: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
         assert!(response.ok);
         assert!(response.thumbprints.unwrap_or_default().len() > 0);
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admin_socket_returns_encrypted_backup() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let key_file = tempfile::NamedTempFile::new().expect("key file");
+        std::fs::write(key_file.path(), [44u8; 32]).expect("write key");
+        let config = TangConfig::new(tempdir.path().to_string_lossy().into_owned());
+        let tang_server = Arc::new(TangServer::new(config).expect("tang server"));
+        let state = AppState {
+            tang_server: tang_server.clone(),
+        };
+
+        let (client, server) = UnixStream::pair().expect("pair");
+        let allowed_gid = nix::unistd::getgid().as_raw();
+
+        let server_task = tokio::spawn(async move {
+            handle_admin_client(server, allowed_gid, state)
+                .await
+                .unwrap();
+        });
+
+        let request = AdminRequest::BackupKeys {
+            backend: "raw-file".to_string(),
+            wrapping_key_file: key_file.path().to_string_lossy().into_owned(),
+        };
+        let (mut read_half, mut write_half) = client.into_split();
+        write_half
+            .write_all(&serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        drop(write_half);
+
+        let mut resp_bytes = Vec::new();
+        read_half.read_to_end(&mut resp_bytes).await.unwrap();
+        let response: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(response.ok);
+        let backup = response.backup.expect("backup artifact");
+        let backend = encrypted_bundle_backend(tempdir.path(), key_file.path());
+        let restored = backend.restore_backup(&backup).expect("restore backup");
+        assert_eq!(restored.key_count(), tang_server.key_store().key_count());
+        assert_eq!(
+            restored.signing_key_count(),
+            tang_server.key_store().signing_key_count()
+        );
 
         server_task.await.unwrap();
     }

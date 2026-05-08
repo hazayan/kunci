@@ -91,7 +91,6 @@ enum Commands {
         /// Path to the client JWK file (JSON format)
         #[arg(short, long)]
         client_jwk: String,
-
     },
     /// Encrypt data using a pin.
     Encrypt {
@@ -154,6 +153,24 @@ enum Commands {
         #[arg(long, default_value = "S256")]
         hash: String,
     },
+    /// Export encrypted Tang server keys through the local admin socket.
+    BackupKeys {
+        /// Path to the local admin Unix socket
+        #[arg(long, default_value = "/var/run/kunci-admin.sock")]
+        admin_sock: String,
+
+        /// Backup encryption backend
+        #[arg(long, default_value = "raw-file")]
+        backend: String,
+
+        /// Raw 32-byte wrapping key file for the raw-file backend
+        #[arg(long)]
+        wrapping_key_file: String,
+
+        /// Output backup artifact path
+        #[arg(short, long)]
+        output: String,
+    },
 }
 
 /// Kunci Clevis client command-line interface.
@@ -180,8 +197,8 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     use std::fs;
-    use tracing::info;
     use std::io::Write;
+    use tracing::info;
 
     // Parse command-line arguments
     let cli = Cli::parse();
@@ -348,7 +365,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let ciphertext_bytes = read_input(input)?;
             let ciphertext: serde_json::Value =
                 serde_json::from_slice(&ciphertext_bytes).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Invalid JSON: {}", e),
+                    )
                 })?;
 
             // Decrypt
@@ -359,42 +379,74 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::Zfs { subcommand } => {
             match subcommand {
-                ZfsCommands::Bind { dataset, pin, config, trust } => {
+                ZfsCommands::Bind {
+                    dataset,
+                    pin,
+                    config,
+                    trust,
+                } => {
                     let _ = writeln!(std::io::stderr(), "KUNCI_CLIENT_ZFS_BIND {}", dataset);
                     let config_json = apply_trust_flag(load_config(config)?, pin, *trust)?;
                     let wrapping_key = kunci_core::zfs::bind_zfs(dataset, pin, &config_json)?;
                     println!("Successfully bound pin '{}' to dataset '{}'", pin, dataset);
-                    println!("Generated wrapping key (hex): {}", hex::encode(wrapping_key));
+                    println!(
+                        "Generated wrapping key (hex): {}",
+                        hex::encode(wrapping_key)
+                    );
                 }
-                ZfsCommands::Unlock { dataset, pin, config, trust } => {
-                    let _ = writeln!(std::io::stderr(), "KUNCI_CLIENT_ZFS_UNLOCK_START {}", dataset);
+                ZfsCommands::Unlock {
+                    dataset,
+                    pin,
+                    config,
+                    trust,
+                } => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "KUNCI_CLIENT_ZFS_UNLOCK_START {}",
+                        dataset
+                    );
                     let config_json = if let Some(config_str) = config {
                         if *trust && pin.is_none() {
                             return Err("--trust requires --pin for zfs unlock".into());
                         }
                         let pin_name = pin.as_deref().unwrap_or("");
-                        Some(apply_trust_flag(load_config(config_str)?, pin_name, *trust)?)
+                        Some(apply_trust_flag(
+                            load_config(config_str)?,
+                            pin_name,
+                            *trust,
+                        )?)
                     } else if *trust {
                         return Err("--trust requires --config for zfs unlock".into());
                     } else {
                         None
                     };
                     let pin_ref = pin.as_deref();
-                    let _ = writeln!(std::io::stderr(), "KUNCI_CLIENT_ZFS_UNLOCK_CALL {}", dataset);
-                    let wrapping_key = kunci_core::zfs::unlock_zfs(dataset, pin_ref, config_json.as_ref())?;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "KUNCI_CLIENT_ZFS_UNLOCK_CALL {}",
+                        dataset
+                    );
+                    let wrapping_key =
+                        kunci_core::zfs::unlock_zfs(dataset, pin_ref, config_json.as_ref())?;
                     let _ = writeln!(std::io::stderr(), "KUNCI_CLIENT_ZFS_UNLOCK_OK {}", dataset);
                     println!("Successfully unlocked dataset '{}'", dataset);
                     println!("Loaded wrapping key (hex): {}", hex::encode(wrapping_key));
                 }
                 ZfsCommands::Unbind { dataset } => {
                     kunci_core::zfs::unbind_zfs(dataset)?;
-                    println!("Successfully removed Clevis binding from dataset '{}'", dataset);
+                    println!(
+                        "Successfully removed Clevis binding from dataset '{}'",
+                        dataset
+                    );
                 }
                 ZfsCommands::List => {
                     let datasets = kunci_core::zfs::list_zfs()?;
                     for dataset in datasets {
                         println!("Dataset: {}", dataset.name);
-                        println!("  Encryption: {}", dataset.encryption.unwrap_or_else(|| "none".to_string()));
+                        println!(
+                            "  Encryption: {}",
+                            dataset.encryption.unwrap_or_else(|| "none".to_string())
+                        );
                         println!("  Key loaded: {}", dataset.loaded);
                         if let Some(jwe) = dataset.clevis_jwe {
                             println!("  Clevis bound: yes");
@@ -417,6 +469,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             for key in keys {
                 println!("{}", key);
             }
+        }
+        Commands::BackupKeys {
+            admin_sock,
+            backend,
+            wrapping_key_file,
+            output,
+        } => {
+            let backup = admin_backup_keys(admin_sock, backend, wrapping_key_file).await?;
+            write_output(output, &backup)?;
         }
     }
 
@@ -543,10 +604,39 @@ async fn admin_show_keys(admin_sock: &str, hash: &str) -> Result<Vec<String>, Bo
     stream.read_to_end(&mut resp_bytes).await?;
     let response: kunci_core::admin::AdminResponse = serde_json::from_slice(&resp_bytes)?;
     if !response.ok {
-        let msg = response.error.unwrap_or_else(|| "Admin request failed".to_string());
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Admin request failed".to_string());
         return Err(msg.into());
     }
     Ok(response.thumbprints.unwrap_or_default())
+}
+
+async fn admin_backup_keys(
+    admin_sock: &str,
+    backend: &str,
+    wrapping_key_file: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut stream = tokio::net::UnixStream::connect(admin_sock).await?;
+    let request = kunci_core::admin::AdminRequest::BackupKeys {
+        backend: backend.to_string(),
+        wrapping_key_file: wrapping_key_file.to_string(),
+    };
+    let bytes = serde_json::to_vec(&request)?;
+    stream.write_all(&bytes).await?;
+    stream.shutdown().await?;
+    let mut resp_bytes = Vec::new();
+    stream.read_to_end(&mut resp_bytes).await?;
+    let response: kunci_core::admin::AdminResponse = serde_json::from_slice(&resp_bytes)?;
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Admin backup failed".to_string());
+        return Err(msg.into());
+    }
+    response
+        .backup
+        .ok_or_else(|| "Admin backup response did not include an artifact".into())
 }
 
 /// Reads input from a file or stdin.
@@ -572,7 +662,7 @@ fn write_output(output: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_show_keys, apply_trust_flag, normalize_config};
+    use super::{admin_backup_keys, admin_show_keys, apply_trust_flag, normalize_config};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -648,6 +738,7 @@ mod tests {
                 kunci_core::admin::AdminRequest::ShowKeys { hash } => {
                     assert_eq!(hash, "S256");
                 }
+                _ => panic!("unexpected admin request"),
             }
             let response = kunci_core::admin::AdminResponse::ok_keys(vec!["abc".to_string()]);
             let bytes = serde_json::to_vec(&response).expect("resp");
@@ -658,6 +749,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec!["abc"]);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admin_backup_keys_happy_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sock_path = tempdir.path().join("admin.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind");
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            let request: kunci_core::admin::AdminRequest =
+                serde_json::from_slice(&buf).expect("request");
+            match request {
+                kunci_core::admin::AdminRequest::BackupKeys {
+                    backend,
+                    wrapping_key_file,
+                } => {
+                    assert_eq!(backend, "raw-file");
+                    assert_eq!(wrapping_key_file, "/tmp/wrap.key");
+                }
+                _ => panic!("unexpected admin request"),
+            }
+            let response = kunci_core::admin::AdminResponse::ok_backup(vec![1, 2, 3]);
+            let bytes = serde_json::to_vec(&response).expect("resp");
+            stream.write_all(&bytes).await.expect("write");
+        });
+
+        let backup = admin_backup_keys(sock_path.to_str().unwrap(), "raw-file", "/tmp/wrap.key")
+            .await
+            .unwrap();
+        assert_eq!(backup, vec![1, 2, 3]);
         server_task.await.unwrap();
     }
 }

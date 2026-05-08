@@ -68,6 +68,7 @@ const SUPPORTED_HASHES: &[&str] = &["S1", "S224", "S256", "S384", "S512"];
 
 const ENCRYPTED_BUNDLE_FILE: &str = "keystore.bundle.json";
 const ENCRYPTED_BUNDLE_KIND: &str = "kunci-server-keystore";
+const ENCRYPTED_BACKUP_KIND: &str = "kunci-server-key-backup";
 const ENCRYPTED_BUNDLE_CIPHER: &str = "A256GCM";
 
 /// Server key storage backend.
@@ -191,13 +192,21 @@ struct PlainKeyBundle {
     rotated_keys: Vec<Jwk>,
 }
 
+/// Encrypted key bundle or encrypted backup envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct EncryptedKeyBundle {
+pub struct EncryptedKeyBundle {
     version: u8,
     kind: String,
     cipher: String,
     nonce: String,
     ciphertext: String,
+}
+
+impl EncryptedKeyBundle {
+    /// Returns the bundle kind.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
 }
 
 /// Encrypted filesystem bundle backend.
@@ -240,14 +249,7 @@ where
             fs::create_dir_all(&self.directory)?;
         }
 
-        let plain = PlainKeyBundle {
-            version: 1,
-            keys: store.keys.clone(),
-            rotated_keys: store.rotated_keys.clone(),
-        };
-        let plaintext = serde_json::to_vec(&plain)
-            .map_err(|e| Error::config(format!("Failed to serialize key bundle: {}", e)))?;
-        let bundle = self.encrypt_bundle(&plaintext)?;
+        let bundle = self.encrypt_store(store, ENCRYPTED_BUNDLE_KIND)?;
         let json = serde_json::to_vec_pretty(&bundle)
             .map_err(|e| Error::config(format!("Failed to serialize encrypted bundle: {}", e)))?;
 
@@ -272,8 +274,52 @@ where
         self.save_store(&store)
     }
 
+    /// Creates an encrypted backup artifact from a key store.
+    pub fn backup_store(&self, store: &KeyStore) -> Result<Vec<u8>> {
+        let bundle = self.encrypt_store(store, ENCRYPTED_BACKUP_KIND)?;
+        serde_json::to_vec_pretty(&bundle)
+            .map_err(|e| Error::config(format!("Failed to serialize encrypted backup: {}", e)))
+    }
+
+    /// Restores a key store from an encrypted backup artifact.
+    pub fn restore_backup(&self, artifact: &[u8]) -> Result<KeyStore> {
+        let bundle: EncryptedKeyBundle = serde_json::from_slice(artifact)
+            .map_err(|e| Error::config(format!("Failed to parse encrypted backup: {}", e)))?;
+        self.decrypt_store(&bundle, ENCRYPTED_BACKUP_KIND)
+    }
+
+    /// Writes an encrypted bundle restored from an encrypted backup artifact.
+    pub fn restore_backup_to_bundle(&self, artifact: &[u8]) -> Result<()> {
+        let store = self.restore_backup(artifact)?;
+        self.save_store(&store)
+    }
+
+    fn encrypt_store(&self, store: &KeyStore, kind: &str) -> Result<EncryptedKeyBundle> {
+        let plain = PlainKeyBundle {
+            version: 1,
+            keys: store.keys.clone(),
+            rotated_keys: store.rotated_keys.clone(),
+        };
+        let plaintext = serde_json::to_vec(&plain)
+            .map_err(|e| Error::config(format!("Failed to serialize key bundle: {}", e)))?;
+        self.encrypt_bundle(&plaintext, kind)
+    }
+
+    fn decrypt_store(&self, bundle: &EncryptedKeyBundle, kind: &str) -> Result<KeyStore> {
+        let plaintext = self.decrypt_bundle(bundle, kind)?;
+        let plain: PlainKeyBundle = serde_json::from_slice(&plaintext)
+            .map_err(|e| Error::config(format!("Failed to parse key bundle: {}", e)))?;
+        if plain.version != 1 {
+            return Err(Error::config(format!(
+                "Unsupported key bundle version: {}",
+                plain.version
+            )));
+        }
+        KeyStore::from_keys(plain.keys, plain.rotated_keys)
+    }
+
     #[allow(deprecated)]
-    fn encrypt_bundle(&self, plaintext: &[u8]) -> Result<EncryptedKeyBundle> {
+    fn encrypt_bundle(&self, plaintext: &[u8], kind: &str) -> Result<EncryptedKeyBundle> {
         let key = self.key_provider.wrapping_key()?;
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|e| Error::crypto(format!("Invalid wrapping key: {}", e)))?;
@@ -285,7 +331,7 @@ where
 
         Ok(EncryptedKeyBundle {
             version: 1,
-            kind: ENCRYPTED_BUNDLE_KIND.to_string(),
+            kind: kind.to_string(),
             cipher: ENCRYPTED_BUNDLE_CIPHER.to_string(),
             nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
             ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
@@ -293,14 +339,14 @@ where
     }
 
     #[allow(deprecated)]
-    fn decrypt_bundle(&self, bundle: &EncryptedKeyBundle) -> Result<Vec<u8>> {
+    fn decrypt_bundle(&self, bundle: &EncryptedKeyBundle, kind: &str) -> Result<Vec<u8>> {
         if bundle.version != 1 {
             return Err(Error::config(format!(
                 "Unsupported encrypted key bundle version: {}",
                 bundle.version
             )));
         }
-        if bundle.kind != ENCRYPTED_BUNDLE_KIND {
+        if bundle.kind != kind {
             return Err(Error::config(format!(
                 "Unsupported encrypted key bundle kind: {}",
                 bundle.kind
@@ -352,16 +398,7 @@ where
         let data = fs::read(&path)?;
         let bundle: EncryptedKeyBundle = serde_json::from_slice(&data)
             .map_err(|e| Error::config(format!("Failed to parse encrypted key bundle: {}", e)))?;
-        let plaintext = self.decrypt_bundle(&bundle)?;
-        let plain: PlainKeyBundle = serde_json::from_slice(&plaintext)
-            .map_err(|e| Error::config(format!("Failed to parse key bundle: {}", e)))?;
-        if plain.version != 1 {
-            return Err(Error::config(format!(
-                "Unsupported key bundle version: {}",
-                plain.version
-            )));
-        }
-        KeyStore::from_keys(plain.keys, plain.rotated_keys)
+        self.decrypt_store(&bundle, ENCRYPTED_BUNDLE_KIND)
     }
 
     fn create_if_empty(&self) -> Result<()> {

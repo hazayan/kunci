@@ -3,3 +3,5 @@
 [00003] [2026-05-08T14:41:17Z] [IMPLEMENTATION] Started the encrypted server keystore milestone by adding Beads tracking, a server key backend abstraction, and an AES-256-GCM encrypted bundle backend with a static test wrapping-key provider.
 [00004] [2026-05-08T14:44:54Z] [TEST] Validated the encrypted bundle backend with kunci-core and kunci-server tests, including round-trip load, wrong wrapping-key rejection, plaintext filesystem migration, and automatic encrypted bundle initialization.
 [00005] [2026-05-08T15:14:20Z] [IMPLEMENTATION] Wired the encrypted-bundle key backend into kunci-server config and key management commands using a temporary raw 32-byte wrapping-key-file provider.
+[00006] [2026-05-08T17:58:03Z] [IMPLEMENTATION] Added encrypted admin backup and restore for server keys using the existing encrypted bundle envelope and raw wrapping-key provider.
+[00007] [2026-05-08T17:58:38Z] [TEST] Validated encrypted admin backup and restore with kunci-server, kunci-client, and kunci-core package tests.
