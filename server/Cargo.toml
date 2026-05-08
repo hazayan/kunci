@@ -57,3 +57,4 @@ full = [
     "nix",
     "libc",
 ]
+fido2 = ["kunci-core/fido2"]

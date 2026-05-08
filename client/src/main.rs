@@ -16,7 +16,7 @@ use std::error::Error;
 use std::io::{Read, Write};
 
 use clap::{Parser, Subcommand};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use kunci_core::tang::{RecoveryRequest, TangClient};
 
@@ -165,7 +165,19 @@ enum Commands {
 
         /// Raw 32-byte wrapping key file for the raw-file backend
         #[arg(long)]
-        wrapping_key_file: String,
+        wrapping_key_file: Option<String>,
+
+        /// FIDO2 credential metadata file for the fido2 backend
+        #[arg(long)]
+        fido2_metadata_file: Option<String>,
+
+        /// FIDO2 device path or auto
+        #[arg(long)]
+        fido2_device: Option<String>,
+
+        /// FIDO2 PIN file
+        #[arg(long)]
+        fido2_pin_file: Option<String>,
 
         /// Output backup artifact path
         #[arg(short, long)]
@@ -474,9 +486,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             admin_sock,
             backend,
             wrapping_key_file,
+            fido2_metadata_file,
+            fido2_device,
+            fido2_pin_file,
             output,
         } => {
-            let backup = admin_backup_keys(admin_sock, backend, wrapping_key_file).await?;
+            let backup = admin_backup_keys(
+                admin_sock,
+                backend,
+                wrapping_key_file.as_deref(),
+                fido2_metadata_file.as_deref(),
+                fido2_device.as_deref(),
+                fido2_pin_file.as_deref(),
+            )
+            .await?;
             write_output(output, &backup)?;
         }
     }
@@ -593,7 +616,14 @@ fn apply_trust_flag(
 }
 
 async fn admin_show_keys(admin_sock: &str, hash: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    let mut stream = tokio::net::UnixStream::connect(admin_sock).await?;
+    let stream = tokio::net::UnixStream::connect(admin_sock).await?;
+    admin_show_keys_stream(stream, hash).await
+}
+
+async fn admin_show_keys_stream<S>(mut stream: S, hash: &str) -> Result<Vec<String>, Box<dyn Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request = kunci_core::admin::AdminRequest::ShowKeys {
         hash: hash.to_string(),
     };
@@ -615,12 +645,40 @@ async fn admin_show_keys(admin_sock: &str, hash: &str) -> Result<Vec<String>, Bo
 async fn admin_backup_keys(
     admin_sock: &str,
     backend: &str,
-    wrapping_key_file: &str,
+    wrapping_key_file: Option<&str>,
+    fido2_metadata_file: Option<&str>,
+    fido2_device: Option<&str>,
+    fido2_pin_file: Option<&str>,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut stream = tokio::net::UnixStream::connect(admin_sock).await?;
+    let stream = tokio::net::UnixStream::connect(admin_sock).await?;
+    admin_backup_keys_stream(
+        stream,
+        backend,
+        wrapping_key_file,
+        fido2_metadata_file,
+        fido2_device,
+        fido2_pin_file,
+    )
+    .await
+}
+
+async fn admin_backup_keys_stream<S>(
+    mut stream: S,
+    backend: &str,
+    wrapping_key_file: Option<&str>,
+    fido2_metadata_file: Option<&str>,
+    fido2_device: Option<&str>,
+    fido2_pin_file: Option<&str>,
+) -> Result<Vec<u8>, Box<dyn Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request = kunci_core::admin::AdminRequest::BackupKeys {
         backend: backend.to_string(),
-        wrapping_key_file: wrapping_key_file.to_string(),
+        wrapping_key_file: wrapping_key_file.unwrap_or_default().to_string(),
+        fido2_metadata_file: fido2_metadata_file.map(ToString::to_string),
+        fido2_device: fido2_device.map(ToString::to_string),
+        fido2_pin_file: fido2_pin_file.map(ToString::to_string),
     };
     let bytes = serde_json::to_vec(&request)?;
     stream.write_all(&bytes).await?;
@@ -662,10 +720,9 @@ fn write_output(output: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_backup_keys, admin_show_keys, apply_trust_flag, normalize_config};
+    use super::{apply_trust_flag, normalize_config};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixListener;
 
     #[test]
     fn test_normalize_config_preserves_tang_node() {
@@ -724,14 +781,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_admin_show_keys_happy_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let sock_path = tempdir.path().join("admin.sock");
-        let listener = UnixListener::bind(&sock_path).expect("bind");
+        let (client, mut server) = tokio::io::duplex(4096);
 
         let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
             let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.expect("read");
+            server.read_to_end(&mut buf).await.expect("read");
             let request: kunci_core::admin::AdminRequest =
                 serde_json::from_slice(&buf).expect("request");
             match request {
@@ -742,46 +796,54 @@ mod tests {
             }
             let response = kunci_core::admin::AdminResponse::ok_keys(vec!["abc".to_string()]);
             let bytes = serde_json::to_vec(&response).expect("resp");
-            stream.write_all(&bytes).await.expect("write");
+            server.write_all(&bytes).await.expect("write");
         });
 
-        let keys = admin_show_keys(sock_path.to_str().unwrap(), "S256")
-            .await
-            .unwrap();
+        let keys = super::admin_show_keys_stream(client, "S256").await.unwrap();
         assert_eq!(keys, vec!["abc"]);
         server_task.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_admin_backup_keys_happy_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let sock_path = tempdir.path().join("admin.sock");
-        let listener = UnixListener::bind(&sock_path).expect("bind");
+        let (client, mut server) = tokio::io::duplex(4096);
 
         let server_task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
             let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.expect("read");
+            server.read_to_end(&mut buf).await.expect("read");
             let request: kunci_core::admin::AdminRequest =
                 serde_json::from_slice(&buf).expect("request");
             match request {
                 kunci_core::admin::AdminRequest::BackupKeys {
                     backend,
                     wrapping_key_file,
+                    fido2_metadata_file,
+                    fido2_device,
+                    fido2_pin_file,
                 } => {
                     assert_eq!(backend, "raw-file");
                     assert_eq!(wrapping_key_file, "/tmp/wrap.key");
+                    assert!(fido2_metadata_file.is_none());
+                    assert!(fido2_device.is_none());
+                    assert!(fido2_pin_file.is_none());
                 }
                 _ => panic!("unexpected admin request"),
             }
             let response = kunci_core::admin::AdminResponse::ok_backup(vec![1, 2, 3]);
             let bytes = serde_json::to_vec(&response).expect("resp");
-            stream.write_all(&bytes).await.expect("write");
+            server.write_all(&bytes).await.expect("write");
         });
 
-        let backup = admin_backup_keys(sock_path.to_str().unwrap(), "raw-file", "/tmp/wrap.key")
-            .await
-            .unwrap();
+        let backup = super::admin_backup_keys_stream(
+            client,
+            "raw-file",
+            Some("/tmp/wrap.key"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(backup, vec![1, 2, 3]);
         server_task.await.unwrap();
     }

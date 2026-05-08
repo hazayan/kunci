@@ -5,3 +5,5 @@
 [00005] [2026-05-08T15:14:20Z] [IMPLEMENTATION] Wired the encrypted-bundle key backend into kunci-server config and key management commands using a temporary raw 32-byte wrapping-key-file provider.
 [00006] [2026-05-08T17:58:03Z] [IMPLEMENTATION] Added encrypted admin backup and restore for server keys using the existing encrypted bundle envelope and raw wrapping-key provider.
 [00007] [2026-05-08T17:58:38Z] [TEST] Validated encrypted admin backup and restore with kunci-server, kunci-client, and kunci-core package tests.
+[00008] [2026-05-08T19:01:40Z] [IMPLEMENTATION] Added an optional fido2-rs hmac-secret wrapping-key provider with FIDO2 enrollment metadata, server backend wiring, and FIDO2 admin backup options.
+[00009] [2026-05-08T19:03:54Z] [TEST] Validated the FIDO2 wrapping provider changes with kunci-client, kunci-core, kunci-server tests and a kunci-server fido2 feature check.

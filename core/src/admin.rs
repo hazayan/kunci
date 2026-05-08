@@ -17,6 +17,12 @@ pub enum AdminRequest {
         backend: String,
         /// Raw 32-byte wrapping key file for the raw-file backend.
         wrapping_key_file: String,
+        /// FIDO2 credential metadata file for the fido2 backend.
+        fido2_metadata_file: Option<String>,
+        /// FIDO2 device path or auto.
+        fido2_device: Option<String>,
+        /// FIDO2 PIN file.
+        fido2_pin_file: Option<String>,
     },
 }
 
@@ -86,6 +92,9 @@ mod tests {
         let req = AdminRequest::BackupKeys {
             backend: "raw-file".to_string(),
             wrapping_key_file: "/tmp/wrap.key".to_string(),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         let data = serde_json::to_vec(&req).unwrap();
         let parsed: AdminRequest = serde_json::from_slice(&data).unwrap();

@@ -32,6 +32,7 @@ p384 = { workspace = true, optional = true, features = ["ecdh", "arithmetic", "e
 p521 = { workspace = true, optional = true, features = ["ecdh", "arithmetic", "ecdsa"] }
 aes-gcm = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+fido2-rs = { workspace = true, optional = true }
 
 # TPM2 dependencies
 tss-esapi = { version = "7", optional = true }
@@ -44,6 +45,7 @@ num-integer = { workspace = true }
 [features]
 default = ["full"]
 full = ["elliptic-curve", "p256", "p384", "p521", "aes-gcm", "reqwest"]
+fido2 = ["full", "fido2-rs"]
 tpm2 = ["tss-esapi"]
 property-test = []
 

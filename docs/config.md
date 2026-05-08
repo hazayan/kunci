@@ -140,9 +140,30 @@ protected by a raw 32-byte wrapping key file:
 }
 ```
 
-The raw wrapping key file must contain exactly 32 bytes. This is a temporary
-provider for the encrypted keystore milestone; the production backend is
-expected to derive the wrapping key from FIDO2 `hmac-secret`.
+The raw wrapping key file must contain exactly 32 bytes. This provider is useful
+for development, migration, and fallback recovery workflows.
+
+When `kunci-server` is built with the `fido2` feature, it can derive the
+encrypted bundle wrapping key from a local FIDO2 authenticator using the
+`hmac-secret` extension:
+
+```json
+{
+  "directory": "/var/db/tang",
+  "key_backend": "fido2",
+  "fido2": {
+    "metadata_file": "/etc/kunci/fido2-credential.json",
+    "device": "auto",
+    "pin_file": "/run/kunci/fido2.pin"
+  }
+}
+```
+
+The metadata file stores non-secret credential data: relying-party ID,
+credential ID, salt, user-verification policy, user-presence policy, and the
+wrapping-key derivation label. It does not store the wrapping key or Tang JWKs.
+If `device` is `auto`, kunci requires exactly one attached authenticator;
+otherwise pass the libfido2 device path explicitly.
 
 Key management commands:
 
@@ -163,6 +184,28 @@ kunci-server key unlock-test \
   --backend encrypted-bundle \
   --directory /var/db/tang \
   --wrapping-key-file /etc/kunci/server-wrap.key
+
+kunci-server key fido2-enroll \
+  --metadata-file /etc/kunci/fido2-credential.json \
+  --rp-id kunci-server.local \
+  --device auto \
+  --pin-file /run/kunci/fido2.pin
+
+kunci-server key migrate \
+  --from filesystem \
+  --to fido2 \
+  --source-directory /var/db/tang.plain \
+  --directory /var/db/tang \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/fido2.pin
+
+kunci-server key unlock-test \
+  --backend fido2 \
+  --directory /var/db/tang \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/fido2.pin
 ```
 
 Encrypted admin backup and restore:
@@ -174,6 +217,14 @@ kunci backup-keys \
   --wrapping-key-file /etc/kunci/backup-wrap.key \
   --output tang-keys.kunci-backup
 
+kunci backup-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/backup-fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/backup-fido2.pin \
+  --output tang-keys.kunci-backup
+
 kunci-server key restore \
   --input tang-keys.kunci-backup \
   --directory /var/db/tang-restored \
@@ -183,5 +234,6 @@ kunci-server key restore \
 The admin backup command asks the running server to encrypt its in-memory key
 store and returns only the encrypted backup artifact over the admin socket. The
 artifact does not expose plaintext JWK material to the client. For this
-milestone, `raw-file` is the only backup wrapping backend; FIDO2 wrapping will
-replace it once the server has a hardware-backed wrapping-key provider.
+artifact does not expose plaintext JWK material to the client. FIDO2-backed
+backup should use a distinct metadata file and preferably a distinct
+authenticator or credential from the one used for normal server start.

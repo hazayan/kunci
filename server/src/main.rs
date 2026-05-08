@@ -34,6 +34,10 @@ use clap::{Parser, Subcommand};
 use kunci_core::{
     Result,
     admin::{AdminRequest, AdminResponse},
+    fido2::{
+        Fido2CredentialMetadata, Fido2EnrollOptions, Fido2UserVerification,
+        Fido2WrappingKeyProvider, default_metadata_file, enroll_fido2_credential, read_pin_file,
+    },
     keys::{
         EncryptedBundleKeyBackend, FilesystemKeyBackend, RawFileWrappingKeyProvider,
         ServerKeyBackend,
@@ -90,13 +94,25 @@ struct Args {
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = false)]
     log_json: Option<bool>,
 
-    /// Server key backend (filesystem or encrypted-bundle)
+    /// Server key backend (filesystem, encrypted-bundle, or fido2)
     #[arg(long)]
     key_backend: Option<String>,
 
     /// Raw 32-byte wrapping key file for encrypted-bundle backend
     #[arg(long)]
     wrapping_key_file: Option<PathBuf>,
+
+    /// FIDO2 credential metadata file
+    #[arg(long)]
+    fido2_metadata_file: Option<PathBuf>,
+
+    /// FIDO2 device path or auto
+    #[arg(long)]
+    fido2_device: Option<String>,
+
+    /// FIDO2 PIN file
+    #[arg(long)]
+    fido2_pin_file: Option<PathBuf>,
 
     /// Command to execute
     #[command(subcommand)]
@@ -123,11 +139,13 @@ enum KeyCommands {
     UnlockTest(KeyCommandArgs),
     /// Restore a key backend from an encrypted backup artifact.
     Restore(KeyRestoreArgs),
+    /// Enroll a FIDO2 hmac-secret credential.
+    Fido2Enroll(Fido2EnrollArgs),
 }
 
 #[derive(clap::Args, Debug)]
 struct KeyCommandArgs {
-    /// Backend to operate on (filesystem or encrypted-bundle)
+    /// Backend to operate on (filesystem, encrypted-bundle, or fido2)
     #[arg(long)]
     backend: Option<String>,
 
@@ -138,6 +156,18 @@ struct KeyCommandArgs {
     /// Raw 32-byte wrapping key file for encrypted-bundle backend
     #[arg(long)]
     wrapping_key_file: Option<PathBuf>,
+
+    /// FIDO2 credential metadata file
+    #[arg(long)]
+    fido2_metadata_file: Option<PathBuf>,
+
+    /// FIDO2 device path or auto
+    #[arg(long)]
+    fido2_device: Option<String>,
+
+    /// FIDO2 PIN file
+    #[arg(long)]
+    fido2_pin_file: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -161,6 +191,18 @@ struct KeyMigrateArgs {
     /// Raw 32-byte wrapping key file for encrypted-bundle backend
     #[arg(long)]
     wrapping_key_file: Option<PathBuf>,
+
+    /// FIDO2 credential metadata file for destination backend
+    #[arg(long)]
+    fido2_metadata_file: Option<PathBuf>,
+
+    /// FIDO2 device path or auto
+    #[arg(long)]
+    fido2_device: Option<String>,
+
+    /// FIDO2 PIN file
+    #[arg(long)]
+    fido2_pin_file: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -176,6 +218,61 @@ struct KeyRestoreArgs {
     /// Raw 32-byte wrapping key file for encrypted-bundle backend.
     #[arg(long)]
     wrapping_key_file: Option<PathBuf>,
+
+    /// FIDO2 credential metadata file for destination backend.
+    #[arg(long)]
+    fido2_metadata_file: Option<PathBuf>,
+
+    /// FIDO2 device path or auto.
+    #[arg(long)]
+    fido2_device: Option<String>,
+
+    /// FIDO2 PIN file.
+    #[arg(long)]
+    fido2_pin_file: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct Fido2EnrollArgs {
+    /// Output FIDO2 credential metadata file.
+    #[arg(long)]
+    metadata_file: Option<PathBuf>,
+
+    /// Key directory used to resolve the default metadata file.
+    #[arg(long)]
+    directory: Option<PathBuf>,
+
+    /// FIDO2 device path or auto.
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Relying-party ID.
+    #[arg(long, default_value = "kunci-server.local")]
+    rp_id: String,
+
+    /// Relying-party display name.
+    #[arg(long, default_value = "Kunci Server")]
+    rp_name: String,
+
+    /// Credential user name.
+    #[arg(long, default_value = "kunci-server")]
+    user_name: String,
+
+    /// Credential user display name.
+    #[arg(long, default_value = "Kunci Server")]
+    user_display_name: String,
+
+    /// User verification policy (discouraged, required, or omit).
+    #[arg(long, default_value = "discouraged")]
+    uv: String,
+
+    /// Require user presence for unlock.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = false)]
+    up: Option<bool>,
+
+    /// FIDO2 PIN file.
+    #[arg(long)]
+    pin_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -200,6 +297,7 @@ struct FileConfig {
     #[serde(alias = "wrapping-key-file")]
     wrapping_key_file: Option<PathBuf>,
     encrypted_bundle: Option<EncryptedBundleFileConfig>,
+    fido2: Option<Fido2FileConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -208,10 +306,20 @@ struct EncryptedBundleFileConfig {
     wrapping_key_file: Option<PathBuf>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct Fido2FileConfig {
+    #[serde(alias = "metadata-file")]
+    metadata_file: Option<PathBuf>,
+    device: Option<String>,
+    #[serde(alias = "pin-file")]
+    pin_file: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyBackendKind {
     Filesystem,
     EncryptedBundle,
+    Fido2,
 }
 
 impl KeyBackendKind {
@@ -219,6 +327,7 @@ impl KeyBackendKind {
         match value {
             "filesystem" => Ok(Self::Filesystem),
             "encrypted-bundle" | "encrypted_bundle" => Ok(Self::EncryptedBundle),
+            "fido2" => Ok(Self::Fido2),
             _ => Err(kunci_core::Error::config(format!(
                 "Unsupported key backend: {}",
                 value
@@ -234,6 +343,9 @@ struct ServerConfig {
     directory: PathBuf,
     key_backend: KeyBackendKind,
     wrapping_key_file: Option<PathBuf>,
+    fido2_metadata_file: Option<PathBuf>,
+    fido2_device: Option<String>,
+    fido2_pin_file: Option<PathBuf>,
     allow_tofu: bool,
     admin_sock: Option<PathBuf>,
     admin_gid: Option<u32>,
@@ -250,6 +362,9 @@ impl Default for ServerConfig {
             directory: PathBuf::from("/var/db/tang"),
             key_backend: KeyBackendKind::Filesystem,
             wrapping_key_file: None,
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
             allow_tofu: false,
             admin_sock: None,
             admin_gid: None,
@@ -282,6 +397,15 @@ impl ServerConfig {
         }
         if let Some(wrapping_key_file) = &args.wrapping_key_file {
             config.wrapping_key_file = Some(wrapping_key_file.clone());
+        }
+        if let Some(fido2_metadata_file) = &args.fido2_metadata_file {
+            config.fido2_metadata_file = Some(fido2_metadata_file.clone());
+        }
+        if let Some(fido2_device) = &args.fido2_device {
+            config.fido2_device = Some(fido2_device.clone());
+        }
+        if let Some(fido2_pin_file) = &args.fido2_pin_file {
+            config.fido2_pin_file = Some(fido2_pin_file.clone());
         }
         if let Some(allow_tofu) = args.allow_tofu {
             config.allow_tofu = allow_tofu;
@@ -340,6 +464,17 @@ impl ServerConfig {
         if let Some(encrypted_bundle) = file_config.encrypted_bundle {
             if let Some(wrapping_key_file) = encrypted_bundle.wrapping_key_file {
                 config.wrapping_key_file = Some(wrapping_key_file);
+            }
+        }
+        if let Some(fido2) = file_config.fido2 {
+            if let Some(metadata_file) = fido2.metadata_file {
+                config.fido2_metadata_file = Some(metadata_file);
+            }
+            if let Some(device) = fido2.device {
+                config.fido2_device = Some(device);
+            }
+            if let Some(pin_file) = fido2.pin_file {
+                config.fido2_pin_file = Some(pin_file);
             }
         }
         if let Some(allow_tofu) = file_config.allow_tofu {
@@ -656,19 +791,53 @@ fn encrypted_bundle_backend(
     )
 }
 
+fn fido2_bundle_backend(
+    directory: &FsPath,
+    metadata_file: &FsPath,
+    device: Option<String>,
+    pin_file: Option<&FsPath>,
+) -> Result<EncryptedBundleKeyBackend<Fido2WrappingKeyProvider>> {
+    let pin = pin_file.map(read_pin_file).transpose()?;
+    let provider = Fido2WrappingKeyProvider::from_metadata_file(metadata_file, device, pin)?;
+    Ok(EncryptedBundleKeyBackend::new(
+        directory.to_path_buf(),
+        provider,
+    ))
+}
+
 fn encrypted_backup_artifact(
     tang_server: &TangServer,
     backend: &str,
-    wrapping_key_file: &FsPath,
+    wrapping_key_file: Option<&FsPath>,
+    fido2_metadata_file: Option<&FsPath>,
+    fido2_device: Option<String>,
+    fido2_pin_file: Option<&FsPath>,
 ) -> Result<Vec<u8>> {
-    if backend != "raw-file" {
-        return Err(kunci_core::Error::config(format!(
+    match backend {
+        "raw-file" => {
+            let wrapping_key_file = wrapping_key_file.ok_or_else(|| {
+                kunci_core::Error::config("Missing wrapping_key_file for raw-file backup backend")
+            })?;
+            let backend = encrypted_bundle_backend(FsPath::new("."), wrapping_key_file);
+            backend.backup_store(tang_server.key_store())
+        }
+        "fido2" => {
+            let metadata_file = fido2_metadata_file.ok_or_else(|| {
+                kunci_core::Error::config("Missing fido2_metadata_file for fido2 backup backend")
+            })?;
+            let backend = fido2_bundle_backend(
+                FsPath::new("."),
+                metadata_file,
+                fido2_device,
+                fido2_pin_file,
+            )?;
+            backend.backup_store(tang_server.key_store())
+        }
+        _ => Err(kunci_core::Error::config(format!(
             "Unsupported backup backend: {}",
             backend
-        )));
+        ))),
     }
-    let backend = encrypted_bundle_backend(FsPath::new("."), wrapping_key_file);
-    backend.backup_store(tang_server.key_store())
 }
 
 fn load_tang_server(config: &ServerConfig) -> Result<TangServer> {
@@ -684,6 +853,18 @@ fn load_tang_server(config: &ServerConfig) -> Result<TangServer> {
                 )
             })?;
             let backend = encrypted_bundle_backend(&config.directory, wrapping_key_file);
+            TangServer::from_backend(tang_config, &backend)
+        }
+        KeyBackendKind::Fido2 => {
+            let metadata_file = config.fido2_metadata_file.as_deref().ok_or_else(|| {
+                kunci_core::Error::config("Missing fido2_metadata_file for fido2 key backend")
+            })?;
+            let backend = fido2_bundle_backend(
+                &config.directory,
+                metadata_file,
+                config.fido2_device.clone(),
+                config.fido2_pin_file.as_deref(),
+            )?;
             TangServer::from_backend(tang_config, &backend)
         }
     }
@@ -709,6 +890,17 @@ fn run_key_command(base_config: &ServerConfig, command: &KeyCommands) -> Result<
                         .with_auto_create(true);
                     backend.create_if_empty()?;
                 }
+                KeyBackendKind::Fido2 => {
+                    let metadata_file = fido2_metadata_file_or_default(&config);
+                    let backend = fido2_bundle_backend(
+                        &config.directory,
+                        &metadata_file,
+                        config.fido2_device.clone(),
+                        config.fido2_pin_file.as_deref(),
+                    )?
+                    .with_auto_create(true);
+                    backend.create_if_empty()?;
+                }
             }
             println!("initialized key backend at {}", config.directory.display());
             Ok(())
@@ -726,6 +918,7 @@ fn run_key_command(base_config: &ServerConfig, command: &KeyCommands) -> Result<
         }
         KeyCommands::Migrate(args) => run_key_migrate(base_config, args),
         KeyCommands::Restore(args) => run_key_restore(base_config, args),
+        KeyCommands::Fido2Enroll(args) => run_fido2_enroll(base_config, args),
     }
 }
 
@@ -740,15 +933,24 @@ fn key_command_config(base_config: &ServerConfig, args: &KeyCommandArgs) -> Resu
     if let Some(wrapping_key_file) = &args.wrapping_key_file {
         config.wrapping_key_file = Some(wrapping_key_file.clone());
     }
+    if let Some(fido2_metadata_file) = &args.fido2_metadata_file {
+        config.fido2_metadata_file = Some(fido2_metadata_file.clone());
+    }
+    if let Some(fido2_device) = &args.fido2_device {
+        config.fido2_device = Some(fido2_device.clone());
+    }
+    if let Some(fido2_pin_file) = &args.fido2_pin_file {
+        config.fido2_pin_file = Some(fido2_pin_file.clone());
+    }
     Ok(config)
 }
 
 fn run_key_migrate(base_config: &ServerConfig, args: &KeyMigrateArgs) -> Result<()> {
     let from = KeyBackendKind::parse(&args.from)?;
     let to = KeyBackendKind::parse(&args.to)?;
-    if from != KeyBackendKind::Filesystem || to != KeyBackendKind::EncryptedBundle {
+    if from != KeyBackendKind::Filesystem {
         return Err(kunci_core::Error::config(
-            "Only filesystem to encrypted-bundle migration is currently supported",
+            "Only filesystem source migration is currently supported",
         ));
     }
 
@@ -756,20 +958,48 @@ fn run_key_migrate(base_config: &ServerConfig, args: &KeyMigrateArgs) -> Result<
         .directory
         .clone()
         .unwrap_or_else(|| base_config.directory.clone());
-    let wrapping_key_file = args
-        .wrapping_key_file
-        .as_deref()
-        .or(base_config.wrapping_key_file.as_deref())
-        .ok_or_else(|| {
-            kunci_core::Error::config(
-                "Missing --wrapping-key-file for encrypted-bundle key migration",
-            )
-        })?;
-    let backend = encrypted_bundle_backend(&directory, wrapping_key_file);
-    backend.migrate_from_filesystem(&args.source_directory)?;
+    match to {
+        KeyBackendKind::Filesystem => {
+            return Err(kunci_core::Error::config(
+                "Filesystem destination migration is not supported",
+            ));
+        }
+        KeyBackendKind::EncryptedBundle => {
+            let wrapping_key_file = args
+                .wrapping_key_file
+                .as_deref()
+                .or(base_config.wrapping_key_file.as_deref())
+                .ok_or_else(|| {
+                    kunci_core::Error::config(
+                        "Missing --wrapping-key-file for encrypted-bundle key migration",
+                    )
+                })?;
+            let backend = encrypted_bundle_backend(&directory, wrapping_key_file);
+            backend.migrate_from_filesystem(&args.source_directory)?;
+        }
+        KeyBackendKind::Fido2 => {
+            let metadata_file = args
+                .fido2_metadata_file
+                .as_deref()
+                .or(base_config.fido2_metadata_file.as_deref())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_metadata_file(&directory));
+            let device = args
+                .fido2_device
+                .clone()
+                .or_else(|| base_config.fido2_device.clone());
+            let pin_file = args
+                .fido2_pin_file
+                .as_deref()
+                .or(base_config.fido2_pin_file.as_deref());
+            let backend = fido2_bundle_backend(&directory, &metadata_file, device, pin_file)?;
+            backend.migrate_from_filesystem(&args.source_directory)?;
+        }
+    }
     println!(
-        "migrated filesystem keys from {} to encrypted bundle at {}",
+        "migrated filesystem keys from {} to {:?} backend at {}",
         args.source_directory.display(),
+        to,
         directory.display()
     );
     Ok(())
@@ -780,13 +1010,6 @@ fn run_key_restore(base_config: &ServerConfig, args: &KeyRestoreArgs) -> Result<
         .directory
         .clone()
         .unwrap_or_else(|| base_config.directory.clone());
-    let wrapping_key_file = args
-        .wrapping_key_file
-        .as_deref()
-        .or(base_config.wrapping_key_file.as_deref())
-        .ok_or_else(|| {
-            kunci_core::Error::config("Missing --wrapping-key-file for encrypted-bundle restore")
-        })?;
     let artifact = fs::read(&args.input).map_err(|e| {
         kunci_core::Error::config(format!(
             "Failed to read backup artifact {}: {}",
@@ -794,14 +1017,85 @@ fn run_key_restore(base_config: &ServerConfig, args: &KeyRestoreArgs) -> Result<
             e
         ))
     })?;
-    let backend = encrypted_bundle_backend(&directory, wrapping_key_file);
-    backend.restore_backup_to_bundle(&artifact)?;
+    match base_config.key_backend {
+        KeyBackendKind::Filesystem | KeyBackendKind::EncryptedBundle => {
+            let wrapping_key_file = args
+                .wrapping_key_file
+                .as_deref()
+                .or(base_config.wrapping_key_file.as_deref())
+                .ok_or_else(|| {
+                    kunci_core::Error::config(
+                        "Missing --wrapping-key-file for encrypted-bundle restore",
+                    )
+                })?;
+            let backend = encrypted_bundle_backend(&directory, wrapping_key_file);
+            backend.restore_backup_to_bundle(&artifact)?;
+        }
+        KeyBackendKind::Fido2 => {
+            let metadata_file = args
+                .fido2_metadata_file
+                .as_deref()
+                .or(base_config.fido2_metadata_file.as_deref())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_metadata_file(&directory));
+            let device = args
+                .fido2_device
+                .clone()
+                .or_else(|| base_config.fido2_device.clone());
+            let pin_file = args
+                .fido2_pin_file
+                .as_deref()
+                .or(base_config.fido2_pin_file.as_deref());
+            let backend = fido2_bundle_backend(&directory, &metadata_file, device, pin_file)?;
+            backend.restore_backup_to_bundle(&artifact)?;
+        }
+    }
     println!(
         "restored encrypted backup {} to encrypted bundle at {}",
         args.input.display(),
         directory.display()
     );
     Ok(())
+}
+
+fn run_fido2_enroll(base_config: &ServerConfig, args: &Fido2EnrollArgs) -> Result<()> {
+    let directory = args
+        .directory
+        .clone()
+        .unwrap_or_else(|| base_config.directory.clone());
+    let metadata_file = args
+        .metadata_file
+        .clone()
+        .or_else(|| base_config.fido2_metadata_file.clone())
+        .unwrap_or_else(|| default_metadata_file(&directory));
+    let pin = args.pin_file.as_deref().map(read_pin_file).transpose()?;
+    let options = Fido2EnrollOptions {
+        device: args
+            .device
+            .clone()
+            .or_else(|| base_config.fido2_device.clone()),
+        rp_id: args.rp_id.clone(),
+        rp_name: args.rp_name.clone(),
+        user_name: args.user_name.clone(),
+        user_display_name: args.user_display_name.clone(),
+        uv: Fido2UserVerification::parse(&args.uv)?,
+        up: args.up.unwrap_or(true),
+        pin,
+    };
+    let metadata: Fido2CredentialMetadata = enroll_fido2_credential(&options)?;
+    metadata.save(&metadata_file)?;
+    println!(
+        "enrolled FIDO2 hmac-secret credential metadata at {}",
+        metadata_file.display()
+    );
+    Ok(())
+}
+
+fn fido2_metadata_file_or_default(config: &ServerConfig) -> PathBuf {
+    config
+        .fido2_metadata_file
+        .clone()
+        .unwrap_or_else(|| default_metadata_file(&config.directory))
 }
 
 const ADMIN_MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -914,10 +1208,20 @@ async fn handle_admin_client(
         AdminRequest::BackupKeys {
             backend,
             wrapping_key_file,
+            fido2_metadata_file,
+            fido2_device,
+            fido2_pin_file,
         } => match encrypted_backup_artifact(
             &state.tang_server,
             &backend,
-            FsPath::new(&wrapping_key_file),
+            if wrapping_key_file.is_empty() {
+                None
+            } else {
+                Some(FsPath::new(&wrapping_key_file))
+            },
+            fido2_metadata_file.as_deref().map(FsPath::new),
+            fido2_device,
+            fido2_pin_file.as_deref().map(FsPath::new),
         ) {
             Ok(artifact) => AdminResponse::ok_backup(artifact),
             Err(err) => AdminResponse::error("ADMIN_BACKUP_FAILED", err.to_string()),
@@ -1151,6 +1455,9 @@ mod tests {
         assert_eq!(config.directory, PathBuf::from("/var/db/tang"));
         assert_eq!(config.key_backend, KeyBackendKind::Filesystem);
         assert!(config.wrapping_key_file.is_none());
+        assert!(config.fido2_metadata_file.is_none());
+        assert!(config.fido2_device.is_none());
+        assert!(config.fido2_pin_file.is_none());
         assert!(!config.allow_tofu);
         assert!(config.admin_sock.is_none());
         assert!(config.admin_gid.is_none());
@@ -1244,6 +1551,40 @@ mod tests {
     }
 
     #[test]
+    fn test_server_config_accepts_fido2_config() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_path = tempdir.path().join("kunci-server.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "directory": "/tmp/kunci-keys",
+                "key_backend": "fido2",
+                "fido2": {
+                    "metadata-file": "/etc/kunci/fido2-credential.json",
+                    "device": "auto",
+                    "pin-file": "/run/kunci/fido2.pin"
+                }
+            }"#,
+        )
+        .expect("write config");
+
+        let args = Args::parse_from(["kunci-server", "--config", config_path.to_str().unwrap()]);
+        let config = ServerConfig::from_args(&args).expect("config");
+
+        assert_eq!(config.directory, PathBuf::from("/tmp/kunci-keys"));
+        assert_eq!(config.key_backend, KeyBackendKind::Fido2);
+        assert_eq!(
+            config.fido2_metadata_file,
+            Some(PathBuf::from("/etc/kunci/fido2-credential.json"))
+        );
+        assert_eq!(config.fido2_device.as_deref(), Some("auto"));
+        assert_eq!(
+            config.fido2_pin_file,
+            Some(PathBuf::from("/run/kunci/fido2.pin"))
+        );
+    }
+
+    #[test]
     fn test_server_config_cli_overrides_file() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_path = tempdir.path().join("kunci-server.json");
@@ -1272,6 +1613,12 @@ mod tests {
             "encrypted-bundle",
             "--wrapping-key-file",
             "/tmp/cli-wrap.key",
+            "--fido2-metadata-file",
+            "/tmp/fido2.json",
+            "--fido2-device",
+            "auto",
+            "--fido2-pin-file",
+            "/tmp/fido2.pin",
             "--allow-tofu=false",
             "--log-level",
             "debug",
@@ -1287,6 +1634,12 @@ mod tests {
             config.wrapping_key_file,
             Some(PathBuf::from("/tmp/cli-wrap.key"))
         );
+        assert_eq!(
+            config.fido2_metadata_file,
+            Some(PathBuf::from("/tmp/fido2.json"))
+        );
+        assert_eq!(config.fido2_device.as_deref(), Some("auto"));
+        assert_eq!(config.fido2_pin_file, Some(PathBuf::from("/tmp/fido2.pin")));
         assert!(!config.allow_tofu);
         assert_eq!(config.log_level.as_deref(), Some("debug"));
         assert!(!config.log_json);
@@ -1307,6 +1660,9 @@ mod tests {
             backend: Some("encrypted-bundle".to_string()),
             directory: Some(bundle_dir.path().to_path_buf()),
             wrapping_key_file: Some(key_file.path().to_path_buf()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         run_key_command(&base, &KeyCommands::Init(init)).expect("init encrypted bundle");
         assert!(bundle_dir.path().join("keystore.bundle.json").exists());
@@ -1315,6 +1671,9 @@ mod tests {
             backend: Some("encrypted-bundle".to_string()),
             directory: Some(bundle_dir.path().to_path_buf()),
             wrapping_key_file: Some(key_file.path().to_path_buf()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         run_key_command(&base, &KeyCommands::UnlockTest(unlock)).expect("unlock encrypted bundle");
 
@@ -1326,6 +1685,9 @@ mod tests {
             source_directory: plaintext_dir.path().to_path_buf(),
             directory: Some(migrated_dir.path().to_path_buf()),
             wrapping_key_file: Some(key_file.path().to_path_buf()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         run_key_command(&base, &KeyCommands::Migrate(migrate)).expect("migrate keys");
         assert!(migrated_dir.path().join("keystore.bundle.json").exists());
@@ -1340,6 +1702,9 @@ mod tests {
             input: backup_file.path().to_path_buf(),
             directory: Some(restored_dir.path().to_path_buf()),
             wrapping_key_file: Some(key_file.path().to_path_buf()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         run_key_command(&base, &KeyCommands::Restore(restore)).expect("restore backup");
         assert!(restored_dir.path().join("keystore.bundle.json").exists());
@@ -1360,6 +1725,9 @@ mod tests {
             backend: Some("encrypted-bundle".to_string()),
             directory: Some(bundle_dir.path().to_path_buf()),
             wrapping_key_file: Some(key_file.path().to_path_buf()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         run_key_command(&ServerConfig::default(), &KeyCommands::Init(init))
             .expect("init encrypted bundle");
@@ -1557,6 +1925,9 @@ mod tests {
         let request = AdminRequest::BackupKeys {
             backend: "raw-file".to_string(),
             wrapping_key_file: key_file.path().to_string_lossy().into_owned(),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
         };
         let (mut read_half, mut write_half) = client.into_split();
         write_half

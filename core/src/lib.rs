@@ -29,6 +29,8 @@ pub mod admin;
 
 /// Error types used throughout the crate.
 pub mod error;
+/// FIDO2 hmac-secret key wrapping support.
+pub mod fido2;
 
 /// Logging helpers for the core crate.
 pub mod log;
