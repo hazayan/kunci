@@ -115,3 +115,52 @@ On the client:
 ```
 kunci show-keys --admin-sock /var/run/kunci-admin.sock --hash S256
 ```
+
+## Server Key Backend
+
+`kunci-server` defaults to the Tang-compatible plaintext filesystem backend:
+
+```json
+{
+  "directory": "/var/db/tang",
+  "key_backend": "filesystem"
+}
+```
+
+For development and migration testing, the server can load an encrypted bundle
+protected by a raw 32-byte wrapping key file:
+
+```json
+{
+  "directory": "/var/db/tang",
+  "key_backend": "encrypted-bundle",
+  "encrypted_bundle": {
+    "wrapping_key_file": "/etc/kunci/server-wrap.key"
+  }
+}
+```
+
+The raw wrapping key file must contain exactly 32 bytes. This is a temporary
+provider for the encrypted keystore milestone; the production backend is
+expected to derive the wrapping key from FIDO2 `hmac-secret`.
+
+Key management commands:
+
+```sh
+kunci-server key init \
+  --backend encrypted-bundle \
+  --directory /var/db/tang \
+  --wrapping-key-file /etc/kunci/server-wrap.key
+
+kunci-server key migrate \
+  --from filesystem \
+  --to encrypted-bundle \
+  --source-directory /var/db/tang.plain \
+  --directory /var/db/tang \
+  --wrapping-key-file /etc/kunci/server-wrap.key
+
+kunci-server key unlock-test \
+  --backend encrypted-bundle \
+  --directory /var/db/tang \
+  --wrapping-key-file /etc/kunci/server-wrap.key
+```

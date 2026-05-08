@@ -30,10 +30,14 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use kunci_core::{
     Result,
     admin::{AdminRequest, AdminResponse},
+    keys::{
+        EncryptedBundleKeyBackend, FilesystemKeyBackend, RawFileWrappingKeyProvider,
+        ServerKeyBackend,
+    },
     tang::{RecoveryRequest, TangConfig, TangPolicy, TangServer},
 };
 use serde::Deserialize;
@@ -85,6 +89,76 @@ struct Args {
     /// Emit JSON logs for server tracing output
     #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = false)]
     log_json: Option<bool>,
+
+    /// Server key backend (filesystem or encrypted-bundle)
+    #[arg(long)]
+    key_backend: Option<String>,
+
+    /// Raw 32-byte wrapping key file for encrypted-bundle backend
+    #[arg(long)]
+    wrapping_key_file: Option<PathBuf>,
+
+    /// Command to execute
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Server key management commands.
+    Key {
+        /// Key command to execute.
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KeyCommands {
+    /// Initialize an empty key backend.
+    Init(KeyCommandArgs),
+    /// Migrate keys from one backend to another.
+    Migrate(KeyMigrateArgs),
+    /// Validate that a key backend can be unlocked and loaded.
+    UnlockTest(KeyCommandArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct KeyCommandArgs {
+    /// Backend to operate on (filesystem or encrypted-bundle)
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Key directory or encrypted bundle directory
+    #[arg(long)]
+    directory: Option<PathBuf>,
+
+    /// Raw 32-byte wrapping key file for encrypted-bundle backend
+    #[arg(long)]
+    wrapping_key_file: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct KeyMigrateArgs {
+    /// Source backend (currently filesystem)
+    #[arg(long)]
+    from: String,
+
+    /// Destination backend (currently encrypted-bundle)
+    #[arg(long)]
+    to: String,
+
+    /// Source key directory
+    #[arg(long)]
+    source_directory: PathBuf,
+
+    /// Destination key directory or encrypted bundle directory
+    #[arg(long)]
+    directory: Option<PathBuf>,
+
+    /// Raw 32-byte wrapping key file for encrypted-bundle backend
+    #[arg(long)]
+    wrapping_key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,13 +178,45 @@ struct FileConfig {
     log_modules: Option<String>,
     #[serde(alias = "log-json")]
     log_json: Option<bool>,
+    #[serde(alias = "key-backend")]
+    key_backend: Option<String>,
+    #[serde(alias = "wrapping-key-file")]
+    wrapping_key_file: Option<PathBuf>,
+    encrypted_bundle: Option<EncryptedBundleFileConfig>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Deserialize)]
+struct EncryptedBundleFileConfig {
+    #[serde(alias = "wrapping-key-file")]
+    wrapping_key_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyBackendKind {
+    Filesystem,
+    EncryptedBundle,
+}
+
+impl KeyBackendKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "filesystem" => Ok(Self::Filesystem),
+            "encrypted-bundle" | "encrypted_bundle" => Ok(Self::EncryptedBundle),
+            _ => Err(kunci_core::Error::config(format!(
+                "Unsupported key backend: {}",
+                value
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ServerConfig {
     bind: String,
     port: u16,
     directory: PathBuf,
+    key_backend: KeyBackendKind,
+    wrapping_key_file: Option<PathBuf>,
     allow_tofu: bool,
     admin_sock: Option<PathBuf>,
     admin_gid: Option<u32>,
@@ -125,6 +231,8 @@ impl Default for ServerConfig {
             bind: "127.0.0.1".to_string(),
             port: 8080,
             directory: PathBuf::from("/var/db/tang"),
+            key_backend: KeyBackendKind::Filesystem,
+            wrapping_key_file: None,
             allow_tofu: false,
             admin_sock: None,
             admin_gid: None,
@@ -151,6 +259,12 @@ impl ServerConfig {
         }
         if let Some(directory) = &args.directory {
             config.directory = directory.clone();
+        }
+        if let Some(key_backend) = &args.key_backend {
+            config.key_backend = KeyBackendKind::parse(key_backend)?;
+        }
+        if let Some(wrapping_key_file) = &args.wrapping_key_file {
+            config.wrapping_key_file = Some(wrapping_key_file.clone());
         }
         if let Some(allow_tofu) = args.allow_tofu {
             config.allow_tofu = allow_tofu;
@@ -199,6 +313,17 @@ impl ServerConfig {
         }
         if let Some(directory) = file_config.directory {
             config.directory = directory;
+        }
+        if let Some(key_backend) = file_config.key_backend {
+            config.key_backend = KeyBackendKind::parse(&key_backend)?;
+        }
+        if let Some(wrapping_key_file) = file_config.wrapping_key_file {
+            config.wrapping_key_file = Some(wrapping_key_file);
+        }
+        if let Some(encrypted_bundle) = file_config.encrypted_bundle {
+            if let Some(wrapping_key_file) = encrypted_bundle.wrapping_key_file {
+                config.wrapping_key_file = Some(wrapping_key_file);
+            }
         }
         if let Some(allow_tofu) = file_config.allow_tofu {
             config.allow_tofu = allow_tofu;
@@ -504,6 +629,119 @@ fn create_router(state: AppState) -> Router {
         .layer(middleware::from_fn(request_log))
 }
 
+fn encrypted_bundle_backend(
+    directory: &FsPath,
+    wrapping_key_file: &FsPath,
+) -> EncryptedBundleKeyBackend<RawFileWrappingKeyProvider> {
+    EncryptedBundleKeyBackend::new(
+        directory.to_path_buf(),
+        RawFileWrappingKeyProvider::new(wrapping_key_file.to_path_buf()),
+    )
+}
+
+fn load_tang_server(config: &ServerConfig) -> Result<TangServer> {
+    let tang_config = TangConfig::new(config.directory.to_string_lossy().into_owned())
+        .with_allow_tofu(config.allow_tofu);
+
+    match config.key_backend {
+        KeyBackendKind::Filesystem => TangServer::new(tang_config),
+        KeyBackendKind::EncryptedBundle => {
+            let wrapping_key_file = config.wrapping_key_file.as_deref().ok_or_else(|| {
+                kunci_core::Error::config(
+                    "Missing wrapping_key_file for encrypted-bundle key backend",
+                )
+            })?;
+            let backend = encrypted_bundle_backend(&config.directory, wrapping_key_file);
+            TangServer::from_backend(tang_config, &backend)
+        }
+    }
+}
+
+fn run_key_command(base_config: &ServerConfig, command: &KeyCommands) -> Result<()> {
+    match command {
+        KeyCommands::Init(args) => {
+            let config = key_command_config(base_config, args)?;
+            match config.key_backend {
+                KeyBackendKind::Filesystem => {
+                    let backend = FilesystemKeyBackend::new(&config.directory);
+                    backend.create_if_empty()?;
+                }
+                KeyBackendKind::EncryptedBundle => {
+                    let wrapping_key_file =
+                        config.wrapping_key_file.as_deref().ok_or_else(|| {
+                            kunci_core::Error::config(
+                                "Missing --wrapping-key-file for encrypted-bundle key init",
+                            )
+                        })?;
+                    let backend = encrypted_bundle_backend(&config.directory, wrapping_key_file)
+                        .with_auto_create(true);
+                    backend.create_if_empty()?;
+                }
+            }
+            println!("initialized key backend at {}", config.directory.display());
+            Ok(())
+        }
+        KeyCommands::UnlockTest(args) => {
+            let config = key_command_config(base_config, args)?;
+            let server = load_tang_server(&config)?;
+            println!(
+                "loaded key backend at {} with {} active keys and {} signing keys",
+                config.directory.display(),
+                server.key_store().key_count(),
+                server.key_store().signing_key_count()
+            );
+            Ok(())
+        }
+        KeyCommands::Migrate(args) => run_key_migrate(base_config, args),
+    }
+}
+
+fn key_command_config(base_config: &ServerConfig, args: &KeyCommandArgs) -> Result<ServerConfig> {
+    let mut config = base_config.clone();
+    if let Some(backend) = &args.backend {
+        config.key_backend = KeyBackendKind::parse(backend)?;
+    }
+    if let Some(directory) = &args.directory {
+        config.directory = directory.clone();
+    }
+    if let Some(wrapping_key_file) = &args.wrapping_key_file {
+        config.wrapping_key_file = Some(wrapping_key_file.clone());
+    }
+    Ok(config)
+}
+
+fn run_key_migrate(base_config: &ServerConfig, args: &KeyMigrateArgs) -> Result<()> {
+    let from = KeyBackendKind::parse(&args.from)?;
+    let to = KeyBackendKind::parse(&args.to)?;
+    if from != KeyBackendKind::Filesystem || to != KeyBackendKind::EncryptedBundle {
+        return Err(kunci_core::Error::config(
+            "Only filesystem to encrypted-bundle migration is currently supported",
+        ));
+    }
+
+    let directory = args
+        .directory
+        .clone()
+        .unwrap_or_else(|| base_config.directory.clone());
+    let wrapping_key_file = args
+        .wrapping_key_file
+        .as_deref()
+        .or(base_config.wrapping_key_file.as_deref())
+        .ok_or_else(|| {
+            kunci_core::Error::config(
+                "Missing --wrapping-key-file for encrypted-bundle key migration",
+            )
+        })?;
+    let backend = encrypted_bundle_backend(&directory, wrapping_key_file);
+    backend.migrate_from_filesystem(&args.source_directory)?;
+    println!(
+        "migrated filesystem keys from {} to encrypted bundle at {}",
+        args.source_directory.display(),
+        directory.display()
+    );
+    Ok(())
+}
+
 const ADMIN_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 async fn run_admin_socket(path: PathBuf, allowed_gid: u32, state: AppState) -> Result<()> {
@@ -673,6 +911,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = ServerConfig::from_args(&args)?;
 
+    if let Some(Commands::Key { command }) = &args.command {
+        return run_key_command(&config, command);
+    }
+
     // Initialize logging
     let tracing_level = config
         .log_level
@@ -698,11 +940,10 @@ async fn main() -> Result<()> {
     info!("Bind address: {}", config.bind);
     info!("Port: {}", config.port);
     info!("Key directory: {:?}", config.directory);
+    info!("Key backend: {:?}", config.key_backend);
     info!("Allow TOFU: {}", config.allow_tofu);
     // Create Tang server instance
-    let tang_config = TangConfig::new(config.directory.to_string_lossy().into_owned())
-        .with_allow_tofu(config.allow_tofu);
-    let tang_server = TangServer::new(tang_config)?;
+    let tang_server = load_tang_server(&config)?;
     let exchange_keys: Vec<String> = tang_server
         .key_store()
         .keys
@@ -835,6 +1076,8 @@ mod tests {
         assert_eq!(config.bind, "127.0.0.1");
         assert_eq!(config.port, 8080);
         assert_eq!(config.directory, PathBuf::from("/var/db/tang"));
+        assert_eq!(config.key_backend, KeyBackendKind::Filesystem);
+        assert!(config.wrapping_key_file.is_none());
         assert!(!config.allow_tofu);
         assert!(config.admin_sock.is_none());
         assert!(config.admin_gid.is_none());
@@ -853,6 +1096,10 @@ mod tests {
                 "bind": "0.0.0.0",
                 "port": 7420,
                 "directory": "/tmp/kunci-keys",
+                "key_backend": "encrypted-bundle",
+                "encrypted_bundle": {
+                    "wrapping_key_file": "/tmp/kunci-wrap.key"
+                },
                 "allow_tofu": true,
                 "admin_sock": "/run/kunci/admin.sock",
                 "admin_gid": 42,
@@ -869,6 +1116,11 @@ mod tests {
         assert_eq!(config.bind, "0.0.0.0");
         assert_eq!(config.port, 7420);
         assert_eq!(config.directory, PathBuf::from("/tmp/kunci-keys"));
+        assert_eq!(config.key_backend, KeyBackendKind::EncryptedBundle);
+        assert_eq!(
+            config.wrapping_key_file,
+            Some(PathBuf::from("/tmp/kunci-wrap.key"))
+        );
         assert!(config.allow_tofu);
         assert_eq!(
             config.admin_sock,
@@ -892,7 +1144,9 @@ mod tests {
                 "admin-gid": 42,
                 "log-level": "trace",
                 "log-modules": "tang",
-                "log-json": true
+                "log-json": true,
+                "key-backend": "encrypted-bundle",
+                "wrapping-key-file": "/tmp/kunci-wrap.key"
             }"#,
         )
         .expect("write config");
@@ -909,6 +1163,11 @@ mod tests {
         assert_eq!(config.log_level.as_deref(), Some("trace"));
         assert_eq!(config.log_modules.as_deref(), Some("tang"));
         assert!(config.log_json);
+        assert_eq!(config.key_backend, KeyBackendKind::EncryptedBundle);
+        assert_eq!(
+            config.wrapping_key_file,
+            Some(PathBuf::from("/tmp/kunci-wrap.key"))
+        );
     }
 
     #[test]
@@ -936,6 +1195,10 @@ mod tests {
             "9000",
             "--directory",
             "/tmp/cli-keys",
+            "--key-backend",
+            "encrypted-bundle",
+            "--wrapping-key-file",
+            "/tmp/cli-wrap.key",
             "--allow-tofu=false",
             "--log-level",
             "debug",
@@ -946,9 +1209,75 @@ mod tests {
         assert_eq!(config.bind, "127.0.0.2");
         assert_eq!(config.port, 9000);
         assert_eq!(config.directory, PathBuf::from("/tmp/cli-keys"));
+        assert_eq!(config.key_backend, KeyBackendKind::EncryptedBundle);
+        assert_eq!(
+            config.wrapping_key_file,
+            Some(PathBuf::from("/tmp/cli-wrap.key"))
+        );
         assert!(!config.allow_tofu);
         assert_eq!(config.log_level.as_deref(), Some("debug"));
         assert!(!config.log_json);
+    }
+
+    #[test]
+    fn test_key_init_unlock_and_migrate_encrypted_bundle() {
+        let plaintext_dir = tempfile::tempdir().expect("plaintext dir");
+        let bundle_dir = tempfile::tempdir().expect("bundle dir");
+        let migrated_dir = tempfile::tempdir().expect("migrated dir");
+        let key_file = tempfile::NamedTempFile::new().expect("key file");
+        std::fs::write(key_file.path(), [42u8; 32]).expect("write key");
+
+        let base = ServerConfig::default();
+        let init = KeyCommandArgs {
+            backend: Some("encrypted-bundle".to_string()),
+            directory: Some(bundle_dir.path().to_path_buf()),
+            wrapping_key_file: Some(key_file.path().to_path_buf()),
+        };
+        run_key_command(&base, &KeyCommands::Init(init)).expect("init encrypted bundle");
+        assert!(bundle_dir.path().join("keystore.bundle.json").exists());
+
+        let unlock = KeyCommandArgs {
+            backend: Some("encrypted-bundle".to_string()),
+            directory: Some(bundle_dir.path().to_path_buf()),
+            wrapping_key_file: Some(key_file.path().to_path_buf()),
+        };
+        run_key_command(&base, &KeyCommands::UnlockTest(unlock)).expect("unlock encrypted bundle");
+
+        let filesystem = FilesystemKeyBackend::new(plaintext_dir.path());
+        filesystem.create_if_empty().expect("create plaintext keys");
+        let migrate = KeyMigrateArgs {
+            from: "filesystem".to_string(),
+            to: "encrypted-bundle".to_string(),
+            source_directory: plaintext_dir.path().to_path_buf(),
+            directory: Some(migrated_dir.path().to_path_buf()),
+            wrapping_key_file: Some(key_file.path().to_path_buf()),
+        };
+        run_key_command(&base, &KeyCommands::Migrate(migrate)).expect("migrate keys");
+        assert!(migrated_dir.path().join("keystore.bundle.json").exists());
+    }
+
+    #[test]
+    fn test_load_tang_server_from_encrypted_bundle() {
+        let bundle_dir = tempfile::tempdir().expect("bundle dir");
+        let key_file = tempfile::NamedTempFile::new().expect("key file");
+        std::fs::write(key_file.path(), [43u8; 32]).expect("write key");
+
+        let mut config = ServerConfig::default();
+        config.directory = bundle_dir.path().to_path_buf();
+        config.key_backend = KeyBackendKind::EncryptedBundle;
+        config.wrapping_key_file = Some(key_file.path().to_path_buf());
+
+        let init = KeyCommandArgs {
+            backend: Some("encrypted-bundle".to_string()),
+            directory: Some(bundle_dir.path().to_path_buf()),
+            wrapping_key_file: Some(key_file.path().to_path_buf()),
+        };
+        run_key_command(&ServerConfig::default(), &KeyCommands::Init(init))
+            .expect("init encrypted bundle");
+
+        let server = load_tang_server(&config).expect("load server");
+        assert_eq!(server.key_store().key_count(), 2);
+        assert_eq!(server.key_store().signing_key_count(), 1);
     }
 
     async fn start_test_server() -> TestServer {

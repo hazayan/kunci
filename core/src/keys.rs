@@ -153,6 +153,37 @@ impl WrappingKeyProvider for StaticWrappingKeyProvider {
     }
 }
 
+/// Raw 32-byte wrapping key provider backed by a file.
+#[derive(Debug, Clone)]
+pub struct RawFileWrappingKeyProvider {
+    path: PathBuf,
+}
+
+impl RawFileWrappingKeyProvider {
+    /// Creates a raw key-file provider.
+    pub fn new<P: Into<PathBuf>>(path: P) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Returns the key file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl WrappingKeyProvider for RawFileWrappingKeyProvider {
+    fn wrapping_key(&self) -> Result<[u8; 32]> {
+        let bytes = fs::read(&self.path)?;
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            Error::config(format!(
+                "Raw wrapping key file {} must contain exactly 32 bytes, got {}",
+                self.path.display(),
+                bytes.len()
+            ))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PlainKeyBundle {
     version: u8,

@@ -378,11 +378,20 @@ impl TangServer {
             jwk_dir = config.jwk_dir.as_str(),
             auto_create_keys = config.auto_create_keys
         );
-        let backend = FilesystemKeyBackend::new(&config.jwk_dir)
-            .with_auto_create(config.auto_create_keys);
-        let key_store = backend.load()?;
+        let backend =
+            FilesystemKeyBackend::new(&config.jwk_dir).with_auto_create(config.auto_create_keys);
+        Self::from_backend(config, &backend)
+    }
 
+    /// Creates a new Tang server instance from a storage backend.
+    pub fn from_backend<B: ServerKeyBackend>(config: TangConfig, backend: &B) -> Result<Self> {
+        let key_store = backend.load()?;
         Ok(Self { config, key_store })
+    }
+
+    /// Creates a new Tang server instance from an already loaded key store.
+    pub fn with_key_store(config: TangConfig, key_store: KeyStore) -> Self {
+        Self { config, key_store }
     }
 
     /// Gets the advertisement.

@@ -2,3 +2,4 @@
 [00002] [2026-05-05T16:55:00Z] [PLANNING] Extended the FIDO2 keystore plan with an admin-side encrypted backup and restore flow using the local admin socket and a FIDO2-locked backup artifact.
 [00003] [2026-05-08T14:41:17Z] [IMPLEMENTATION] Started the encrypted server keystore milestone by adding Beads tracking, a server key backend abstraction, and an AES-256-GCM encrypted bundle backend with a static test wrapping-key provider.
 [00004] [2026-05-08T14:44:54Z] [TEST] Validated the encrypted bundle backend with kunci-core and kunci-server tests, including round-trip load, wrong wrapping-key rejection, plaintext filesystem migration, and automatic encrypted bundle initialization.
+[00005] [2026-05-08T15:14:20Z] [IMPLEMENTATION] Wired the encrypted-bundle key backend into kunci-server config and key management commands using a temporary raw 32-byte wrapping-key-file provider.
