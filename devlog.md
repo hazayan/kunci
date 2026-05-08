@@ -7,3 +7,4 @@
 [00007] [2026-05-08T17:58:38Z] [TEST] Validated encrypted admin backup and restore with kunci-server, kunci-client, and kunci-core package tests.
 [00008] [2026-05-08T19:01:40Z] [IMPLEMENTATION] Added an optional fido2-rs hmac-secret wrapping-key provider with FIDO2 enrollment metadata, server backend wiring, and FIDO2 admin backup options.
 [00009] [2026-05-08T19:03:54Z] [TEST] Validated the FIDO2 wrapping provider changes with kunci-client, kunci-core, kunci-server tests and a kunci-server fido2 feature check.
+[00010] [2026-05-08T19:19:06Z] [TEST] Validated FIDO2 hmac-secret wrapping on a TrustKey T120 with enrollment, filesystem-to-fido2 migration, unlock-test, encrypted admin backup, restore, and restored unlock-test.
