@@ -8,3 +8,4 @@
 [00008] [2026-05-08T19:01:40Z] [IMPLEMENTATION] Added an optional fido2-rs hmac-secret wrapping-key provider with FIDO2 enrollment metadata, server backend wiring, and FIDO2 admin backup options.
 [00009] [2026-05-08T19:03:54Z] [TEST] Validated the FIDO2 wrapping provider changes with kunci-client, kunci-core, kunci-server tests and a kunci-server fido2 feature check.
 [00010] [2026-05-08T19:19:06Z] [TEST] Validated FIDO2 hmac-secret wrapping on a TrustKey T120 with enrollment, filesystem-to-fido2 migration, unlock-test, encrypted admin backup, restore, and restored unlock-test.
+[00011] [2026-05-09T01:51:00Z] [CONFIG] Encrypted the Beads issues export with git-crypt, granted GPG key 83D121B5F6A8A730 access, and documented the default encrypted Beads policy.

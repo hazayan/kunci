@@ -53,6 +53,8 @@ bd close <id>         # Complete work
 ### Rules
 
 - Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Keep `.beads/issues.jsonl` encrypted in Git with `git-crypt`; the working tree must remain plaintext for `bd`
+- Run `scripts/check-beads-git-crypt.sh` before committing Beads changes
 - Run `bd prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
 
