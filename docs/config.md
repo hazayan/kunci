@@ -233,7 +233,8 @@ kunci-server key restore \
 
 The admin backup command asks the running server to encrypt its in-memory key
 store and returns only the encrypted backup artifact over the admin socket. The
-artifact does not expose plaintext JWK material to the client. For this
 artifact does not expose plaintext JWK material to the client. FIDO2-backed
 backup should use a distinct metadata file and preferably a distinct
-authenticator or credential from the one used for normal server start.
+authenticator or credential from the one used for normal server start. See
+[Trust Services Backup](trust-services-backup.md) for the primary/backup host
+operational model.

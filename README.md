@@ -15,6 +15,8 @@ are:
 - FreeBSD ZFS bind, unlock, unbind, and list flows built around `kunci:jwe`
   and related dataset properties
 - a local admin socket path for server key inspection via `show-keys`
+- FIDO2-wrapped encrypted server keystore support and encrypted admin backups
+  for server keys
 
 The repository also contains additional pin and storage code, but not all of it
 is complete enough to present as production-ready.
@@ -84,6 +86,11 @@ Show server signing key thumbprints via the local admin socket:
 kunci-server --admin-sock /var/run/kunci-admin.sock --admin-gid 1000
 kunci show-keys --admin-sock /var/run/kunci-admin.sock --hash S256
 ```
+
+Server key storage can be protected at rest with a FIDO2 authenticator, and
+encrypted backup artifacts can use a distinct FIDO2 credential. See
+[configuration](docs/config.md) and
+[trust services backup](docs/trust-services-backup.md).
 
 ## Build
 

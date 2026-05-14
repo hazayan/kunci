@@ -9,3 +9,4 @@
 [00009] [2026-05-08T19:03:54Z] [TEST] Validated the FIDO2 wrapping provider changes with kunci-client, kunci-core, kunci-server tests and a kunci-server fido2 feature check.
 [00010] [2026-05-08T19:19:06Z] [TEST] Validated FIDO2 hmac-secret wrapping on a TrustKey T120 with enrollment, filesystem-to-fido2 migration, unlock-test, encrypted admin backup, restore, and restored unlock-test.
 [00011] [2026-05-09T01:51:00Z] [CONFIG] Encrypted the Beads issues export with git-crypt, granted GPG key 83D121B5F6A8A730 access, and documented the default encrypted Beads policy.
+[00012] [2026-05-14T01:42:15Z] [PLANNING] Documented the trust-services backup model for colocated kunci-server and Knox deployments, keeping separate FIDO2 credentials per service and requiring an off-host encrypted kunci backup plus restore drill for the future backup host.
