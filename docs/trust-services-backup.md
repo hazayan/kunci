@@ -1,14 +1,13 @@
 # Trust Services Backup
 
-`kunci-server` is expected to run on the same trust-services host as Knox for
-the first production deployment. Sharing the same physical TrustKey is
-operationally useful, but each service must use separate FIDO2 credentials and
-metadata.
+`kunci-server` may run on the same trust-services host as Knox. Sharing the
+same physical authenticator is operationally useful, but each service must use
+separate FIDO2 credentials and metadata.
 
 Recommended primary host layout:
 
 ```text
-identity-a
+identity-primary
   kunci-server
     /usr/local/etc/kunci/fido2-credential.json
     /var/db/kunci-server/keys
@@ -17,8 +16,8 @@ identity-a
     /var/db/knox
 ```
 
-The same TrustKey device may hold both credentials, but kunci and Knox should
-not share RP IDs, salts, metadata files, or backup credentials.
+The same physical authenticator may hold both credentials, but kunci and Knox
+should not share RP IDs, salts, metadata files, or backup credentials.
 
 ## Kunci Backup
 
@@ -32,7 +31,7 @@ Use a backup credential distinct from the normal server-start credential:
 ```sh
 kunci-server key fido2-enroll \
   --metadata-file /usr/local/etc/kunci/backup-fido2-credential.json \
-  --rp-id identity-a-kunci-backup \
+  --rp-id identity-primary-kunci-backup \
   --device auto \
   --pin-file /run/kunci/backup-fido2.pin
 
