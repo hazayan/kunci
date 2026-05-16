@@ -11,3 +11,4 @@
 [00011] [2026-05-09T01:51:00Z] [CONFIG] Encrypted the Beads issues export with git-crypt, granted GPG key 83D121B5F6A8A730 access, and documented the default encrypted Beads policy.
 [00012] [2026-05-14T01:42:15Z] [PLANNING] Documented the trust-services backup model for colocated kunci-server and Knox deployments, keeping separate FIDO2 credentials per service and requiring an off-host encrypted kunci backup plus restore drill for the future backup host.
 [00013] [2026-05-15T22:02:38Z] [SECURITY] Sanitized current-tree FIDO2 backup documentation and operational notes to remove host-specific and hardware-model details before continuing repository scrub work.
+[00014] [2026-05-16T19:16:52Z] [SECURITY] Replaced the stale personal GitHub repository metadata with the SourceHut project URL and rechecked the current tree for known internal host and domain identifiers.
