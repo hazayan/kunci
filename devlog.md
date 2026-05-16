@@ -13,3 +13,4 @@
 [00013] [2026-05-15T22:02:38Z] [SECURITY] Sanitized current-tree FIDO2 backup documentation and operational notes to remove host-specific and hardware-model details before continuing repository scrub work.
 [00014] [2026-05-16T19:16:52Z] [SECURITY] Replaced the stale personal GitHub repository metadata with the SourceHut project URL and rechecked the current tree for known internal host and domain identifiers.
 [00015] [2026-05-16T19:19:24Z] [SECURITY] Rewrote reachable Git history to replace earlier internal host-specific backup notes and stale personal repository URLs with neutral example values.
+[00016] [2026-05-16T19:53:50Z] [TROUBLESHOOTING] Prepared a fido2-enabled kunci build for the restore drill and recorded that hardware validation is blocked until a FIDO2 authenticator is visible on the local or backup trust host.
