@@ -183,6 +183,36 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// Unlock Tang server keys through the local admin socket.
+    UnlockKeys {
+        /// Path to the local admin Unix socket
+        #[arg(long, default_value = "/var/run/kunci-admin.sock")]
+        admin_sock: String,
+
+        /// Unlock backend override
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Raw 32-byte wrapping key file for the raw-file backend
+        #[arg(long)]
+        wrapping_key_file: Option<String>,
+
+        /// FIDO2 credential metadata file for the fido2 backend
+        #[arg(long)]
+        fido2_metadata_file: Option<String>,
+
+        /// FIDO2 device path or auto
+        #[arg(long)]
+        fido2_device: Option<String>,
+
+        /// FIDO2 PIN file
+        #[arg(long)]
+        fido2_pin_file: Option<String>,
+
+        /// Optional encrypted backup artifact path
+        #[arg(long)]
+        backup: Option<String>,
+    },
 }
 
 /// Kunci Clevis client command-line interface.
@@ -502,6 +532,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
             write_output(output, &backup)?;
         }
+        Commands::UnlockKeys {
+            admin_sock,
+            backend,
+            wrapping_key_file,
+            fido2_metadata_file,
+            fido2_device,
+            fido2_pin_file,
+            backup,
+        } => {
+            let status = admin_unlock_keys(
+                admin_sock,
+                backend.as_deref(),
+                wrapping_key_file.as_deref(),
+                fido2_metadata_file.as_deref(),
+                fido2_device.as_deref(),
+                fido2_pin_file.as_deref(),
+                backup.as_deref(),
+            )
+            .await?;
+            println!(
+                "unlocked {} active keys and {} signing keys",
+                status.key_count, status.signing_key_count
+            );
+        }
     }
 
     Ok(())
@@ -697,6 +751,66 @@ where
         .ok_or_else(|| "Admin backup response did not include an artifact".into())
 }
 
+async fn admin_unlock_keys(
+    admin_sock: &str,
+    backend: Option<&str>,
+    wrapping_key_file: Option<&str>,
+    fido2_metadata_file: Option<&str>,
+    fido2_device: Option<&str>,
+    fido2_pin_file: Option<&str>,
+    backup: Option<&str>,
+) -> Result<kunci_core::admin::AdminUnlockStatus, Box<dyn Error>> {
+    let stream = tokio::net::UnixStream::connect(admin_sock).await?;
+    let backup = backup.map(std::fs::read).transpose()?;
+    admin_unlock_keys_stream(
+        stream,
+        backend,
+        wrapping_key_file,
+        fido2_metadata_file,
+        fido2_device,
+        fido2_pin_file,
+        backup,
+    )
+    .await
+}
+
+async fn admin_unlock_keys_stream<S>(
+    mut stream: S,
+    backend: Option<&str>,
+    wrapping_key_file: Option<&str>,
+    fido2_metadata_file: Option<&str>,
+    fido2_device: Option<&str>,
+    fido2_pin_file: Option<&str>,
+    backup: Option<Vec<u8>>,
+) -> Result<kunci_core::admin::AdminUnlockStatus, Box<dyn Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = kunci_core::admin::AdminRequest::UnlockKeys {
+        backend: backend.map(ToString::to_string),
+        wrapping_key_file: wrapping_key_file.map(ToString::to_string),
+        fido2_metadata_file: fido2_metadata_file.map(ToString::to_string),
+        fido2_device: fido2_device.map(ToString::to_string),
+        fido2_pin_file: fido2_pin_file.map(ToString::to_string),
+        backup,
+    };
+    let bytes = serde_json::to_vec(&request)?;
+    stream.write_all(&bytes).await?;
+    stream.shutdown().await?;
+    let mut resp_bytes = Vec::new();
+    stream.read_to_end(&mut resp_bytes).await?;
+    let response: kunci_core::admin::AdminResponse = serde_json::from_slice(&resp_bytes)?;
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Admin unlock failed".to_string());
+        return Err(msg.into());
+    }
+    response
+        .unlocked
+        .ok_or_else(|| "Admin unlock response did not include status".into())
+}
+
 /// Reads input from a file or stdin.
 fn read_input(input: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     if input == "-" {
@@ -721,6 +835,7 @@ fn write_output(output: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::{apply_trust_flag, normalize_config};
+    use kunci_core::admin::AdminUnlockStatus;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -845,6 +960,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(backup, vec![1, 2, 3]);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admin_unlock_keys_happy_path() {
+        let (client, mut server) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            server.read_to_end(&mut buf).await.expect("read");
+            let request: kunci_core::admin::AdminRequest =
+                serde_json::from_slice(&buf).expect("request");
+            match request {
+                kunci_core::admin::AdminRequest::UnlockKeys {
+                    backend,
+                    wrapping_key_file,
+                    fido2_metadata_file,
+                    fido2_device,
+                    fido2_pin_file,
+                    backup,
+                } => {
+                    assert_eq!(backend.as_deref(), Some("raw-file"));
+                    assert_eq!(wrapping_key_file.as_deref(), Some("/tmp/wrap.key"));
+                    assert!(fido2_metadata_file.is_none());
+                    assert!(fido2_device.is_none());
+                    assert!(fido2_pin_file.is_none());
+                    assert_eq!(backup, Some(vec![1, 2, 3]));
+                }
+                _ => panic!("unexpected admin request"),
+            }
+            let response = kunci_core::admin::AdminResponse::ok_unlocked(2, 1);
+            let bytes = serde_json::to_vec(&response).expect("resp");
+            server.write_all(&bytes).await.expect("write");
+        });
+
+        let status = super::admin_unlock_keys_stream(
+            client,
+            Some("raw-file"),
+            Some("/tmp/wrap.key"),
+            None,
+            None,
+            None,
+            Some(vec![1, 2, 3]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            status,
+            AdminUnlockStatus {
+                key_count: 2,
+                signing_key_count: 1
+            }
+        );
         server_task.await.unwrap();
     }
 }

@@ -24,6 +24,30 @@ pub enum AdminRequest {
         /// FIDO2 PIN file.
         fido2_pin_file: Option<String>,
     },
+    /// Load Tang server keys into a locked server through the local admin socket.
+    UnlockKeys {
+        /// Optional backend override used to load or decrypt the keys.
+        backend: Option<String>,
+        /// Raw 32-byte wrapping key file for the raw-file backend.
+        wrapping_key_file: Option<String>,
+        /// FIDO2 credential metadata file for the fido2 backend.
+        fido2_metadata_file: Option<String>,
+        /// FIDO2 device path or auto.
+        fido2_device: Option<String>,
+        /// FIDO2 PIN file.
+        fido2_pin_file: Option<String>,
+        /// Optional encrypted backup artifact to load into memory.
+        backup: Option<Vec<u8>>,
+    },
+}
+
+/// Successful unlock metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUnlockStatus {
+    /// Number of active exchange keys loaded.
+    pub key_count: usize,
+    /// Number of signing keys loaded.
+    pub signing_key_count: usize,
 }
 
 /// Admin responses returned to the client.
@@ -35,6 +59,8 @@ pub struct AdminResponse {
     pub thumbprints: Option<Vec<String>>,
     /// Optional encrypted backup artifact when successful.
     pub backup: Option<Vec<u8>>,
+    /// Optional unlock metadata when successful.
+    pub unlocked: Option<AdminUnlockStatus>,
     /// Optional error message on failure.
     pub error: Option<String>,
     /// Optional machine-readable error code.
@@ -48,6 +74,7 @@ impl AdminResponse {
             ok: true,
             thumbprints: Some(keys),
             backup: None,
+            unlocked: None,
             error: None,
             code: None,
         }
@@ -59,6 +86,22 @@ impl AdminResponse {
             ok: true,
             thumbprints: None,
             backup: Some(backup),
+            unlocked: None,
+            error: None,
+            code: None,
+        }
+    }
+
+    /// Convenience constructor for a successful unlock response.
+    pub fn ok_unlocked(key_count: usize, signing_key_count: usize) -> Self {
+        Self {
+            ok: true,
+            thumbprints: None,
+            backup: None,
+            unlocked: Some(AdminUnlockStatus {
+                key_count,
+                signing_key_count,
+            }),
             error: None,
             code: None,
         }
@@ -70,6 +113,7 @@ impl AdminResponse {
             ok: false,
             thumbprints: None,
             backup: None,
+            unlocked: None,
             error: Some(message.into()),
             code: Some(code.into()),
         }
@@ -84,6 +128,18 @@ mod tests {
     fn test_admin_request_roundtrip() {
         let req = AdminRequest::ShowKeys {
             hash: "S256".to_string(),
+        };
+        let data = serde_json::to_vec(&req).unwrap();
+        let parsed: AdminRequest = serde_json::from_slice(&data).unwrap();
+        assert_eq!(req, parsed);
+
+        let req = AdminRequest::UnlockKeys {
+            backend: Some("raw-file".to_string()),
+            wrapping_key_file: Some("/tmp/wrap.key".to_string()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
+            backup: Some(vec![1, 2, 3]),
         };
         let data = serde_json::to_vec(&req).unwrap();
         let parsed: AdminRequest = serde_json::from_slice(&data).unwrap();
@@ -109,6 +165,11 @@ mod tests {
         assert_eq!(resp, parsed);
 
         let resp = AdminResponse::ok_backup(vec![1, 2, 3]);
+        let data = serde_json::to_vec(&resp).unwrap();
+        let parsed: AdminResponse = serde_json::from_slice(&data).unwrap();
+        assert_eq!(resp, parsed);
+
+        let resp = AdminResponse::ok_unlocked(2, 1);
         let data = serde_json::to_vec(&resp).unwrap();
         let parsed: AdminResponse = serde_json::from_slice(&data).unwrap();
         assert_eq!(resp, parsed);

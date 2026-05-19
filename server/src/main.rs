@@ -48,7 +48,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tracing::info;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 /// Command-line arguments for the Tang server.
 #[derive(Parser, Debug)]
@@ -503,7 +504,41 @@ impl ServerConfig {
 /// Server state shared across all handlers.
 #[derive(Clone)]
 struct AppState {
-    tang_server: Arc<TangServer>,
+    config: Arc<ServerConfig>,
+    tang_server: Arc<RwLock<Option<Arc<TangServer>>>>,
+}
+
+impl AppState {
+    fn new(config: ServerConfig, tang_server: Option<TangServer>) -> Self {
+        Self {
+            config: Arc::new(config),
+            tang_server: Arc::new(RwLock::new(tang_server.map(Arc::new))),
+        }
+    }
+
+    async fn loaded_server(&self) -> std::result::Result<Arc<TangServer>, HttpError> {
+        self.tang_server
+            .read()
+            .await
+            .clone()
+            .ok_or_else(locked_error)
+    }
+
+    async fn replace_server(&self, tang_server: TangServer) -> (usize, usize) {
+        let key_count = tang_server.key_store().key_count();
+        let signing_key_count = tang_server.key_store().signing_key_count();
+        let mut slot = self.tang_server.write().await;
+        *slot = Some(Arc::new(tang_server));
+        (key_count, signing_key_count)
+    }
+}
+
+fn locked_error() -> HttpError {
+    HttpError::with_code(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SERVER_LOCKED",
+        "Kunci server keys are locked",
+    )
 }
 
 /// HTTP response type for errors.
@@ -600,7 +635,8 @@ async fn get_advertisement(
         level: kunci_core::log::LogLevel::Debug,
         "get_adv_start"
     );
-    let advertisement = state.tang_server.get_advertisement()?;
+    let tang_server = state.loaded_server().await?;
+    let advertisement = tang_server.get_advertisement()?;
     kunci_core::klog!(
         module: "http",
         level: kunci_core::log::LogLevel::Debug,
@@ -629,7 +665,8 @@ async fn get_advertisement_with_key(
         "get_adv_key_start";
         kid = thumbprint.clone()
     );
-    let advertisement = state.tang_server.get_advertisement_with_key(&thumbprint)?;
+    let tang_server = state.loaded_server().await?;
+    let advertisement = tang_server.get_advertisement_with_key(&thumbprint)?;
     kunci_core::klog!(
         module: "http",
         level: kunci_core::log::LogLevel::Debug,
@@ -663,7 +700,8 @@ async fn post_recovery(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("tofu"))
         .unwrap_or(false);
-    if tofu_requested && !state.tang_server.config().allow_tofu {
+    let tang_server = state.loaded_server().await?;
+    if tofu_requested && !tang_server.config().allow_tofu {
         kunci_core::klog!(
             module: "http",
             level: kunci_core::log::LogLevel::Warn,
@@ -684,8 +722,7 @@ async fn post_recovery(
         kid = thumbprint.clone()
     );
 
-    let has_key = state
-        .tang_server
+    let has_key = tang_server
         .key_store()
         .find_exchange_key(&thumbprint)?
         .is_some();
@@ -697,7 +734,7 @@ async fn post_recovery(
         exchange_key_present = has_key
     );
 
-    let response = state.tang_server.recover(&thumbprint, &request)?;
+    let response = tang_server.recover(&thumbprint, &request)?;
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", "application/jwk+json".parse().unwrap());
     let response_len = serde_json::to_vec(&response)
@@ -717,8 +754,9 @@ async fn post_recovery(
 async fn get_policy(
     State(state): State<AppState>,
 ) -> std::result::Result<impl IntoResponse, HttpError> {
+    let tang_server = state.loaded_server().await?;
     let policy = TangPolicy {
-        allow_tofu: state.tang_server.config().allow_tofu,
+        allow_tofu: tang_server.config().allow_tofu,
     };
     Ok(Json(policy))
 }
@@ -840,9 +878,48 @@ fn encrypted_backup_artifact(
     }
 }
 
+fn tang_config(config: &ServerConfig) -> TangConfig {
+    TangConfig::new(config.directory.to_string_lossy().into_owned())
+        .with_allow_tofu(config.allow_tofu)
+}
+
+fn backup_key_store(
+    artifact: &[u8],
+    backend: &str,
+    wrapping_key_file: Option<&FsPath>,
+    fido2_metadata_file: Option<&FsPath>,
+    fido2_device: Option<String>,
+    fido2_pin_file: Option<&FsPath>,
+) -> Result<kunci_core::keys::KeyStore> {
+    match backend {
+        "raw-file" => {
+            let wrapping_key_file = wrapping_key_file.ok_or_else(|| {
+                kunci_core::Error::config("Missing wrapping_key_file for raw-file unlock backend")
+            })?;
+            let backend = encrypted_bundle_backend(FsPath::new("."), wrapping_key_file);
+            backend.restore_backup(artifact)
+        }
+        "fido2" => {
+            let metadata_file = fido2_metadata_file.ok_or_else(|| {
+                kunci_core::Error::config("Missing fido2_metadata_file for fido2 unlock backend")
+            })?;
+            let backend = fido2_bundle_backend(
+                FsPath::new("."),
+                metadata_file,
+                fido2_device,
+                fido2_pin_file,
+            )?;
+            backend.restore_backup(artifact)
+        }
+        _ => Err(kunci_core::Error::config(format!(
+            "Unsupported unlock backend: {}",
+            backend
+        ))),
+    }
+}
+
 fn load_tang_server(config: &ServerConfig) -> Result<TangServer> {
-    let tang_config = TangConfig::new(config.directory.to_string_lossy().into_owned())
-        .with_allow_tofu(config.allow_tofu);
+    let tang_config = tang_config(config);
 
     match config.key_backend {
         KeyBackendKind::Filesystem => TangServer::new(tang_config),
@@ -868,6 +945,50 @@ fn load_tang_server(config: &ServerConfig) -> Result<TangServer> {
             TangServer::from_backend(tang_config, &backend)
         }
     }
+}
+
+fn unlock_tang_server(
+    config: &ServerConfig,
+    backend: Option<&str>,
+    wrapping_key_file: Option<&FsPath>,
+    fido2_metadata_file: Option<&FsPath>,
+    fido2_device: Option<String>,
+    fido2_pin_file: Option<&FsPath>,
+    backup: Option<&[u8]>,
+) -> Result<TangServer> {
+    if let Some(artifact) = backup {
+        let backend = backend.ok_or_else(|| {
+            kunci_core::Error::config("Missing backend for encrypted backup unlock")
+        })?;
+        let key_store = backup_key_store(
+            artifact,
+            backend,
+            wrapping_key_file,
+            fido2_metadata_file,
+            fido2_device,
+            fido2_pin_file,
+        )?;
+        return Ok(TangServer::with_key_store(tang_config(config), key_store));
+    }
+
+    let mut unlocked_config = config.clone();
+    if let Some(backend) = backend {
+        unlocked_config.key_backend = KeyBackendKind::parse(backend)?;
+    }
+    if let Some(wrapping_key_file) = wrapping_key_file {
+        unlocked_config.wrapping_key_file = Some(wrapping_key_file.to_path_buf());
+    }
+    if let Some(fido2_metadata_file) = fido2_metadata_file {
+        unlocked_config.fido2_metadata_file = Some(fido2_metadata_file.to_path_buf());
+    }
+    if let Some(fido2_device) = fido2_device {
+        unlocked_config.fido2_device = Some(fido2_device);
+    }
+    if let Some(fido2_pin_file) = fido2_pin_file {
+        unlocked_config.fido2_pin_file = Some(fido2_pin_file.to_path_buf());
+    }
+
+    load_tang_server(&unlocked_config)
 }
 
 fn run_key_command(base_config: &ServerConfig, command: &KeyCommands) -> Result<()> {
@@ -1189,20 +1310,23 @@ async fn handle_admin_client(
     let response = match request {
         AdminRequest::ShowKeys { hash } => {
             let hash = hash.as_str();
-            match hash {
-                "S1" | "S224" | "S256" | "S384" | "S512" => {
-                    let mut keys = Vec::new();
-                    for key in &state.tang_server.key_store().signing_keys {
-                        if let Ok(tp) = key.thumbprint(hash) {
-                            keys.push(tp);
+            match state.tang_server.read().await.clone() {
+                Some(tang_server) => match hash {
+                    "S1" | "S224" | "S256" | "S384" | "S512" => {
+                        let mut keys = Vec::new();
+                        for key in &tang_server.key_store().signing_keys {
+                            if let Ok(tp) = key.thumbprint(hash) {
+                                keys.push(tp);
+                            }
                         }
+                        AdminResponse::ok_keys(keys)
                     }
-                    AdminResponse::ok_keys(keys)
-                }
-                _ => AdminResponse::error(
-                    "ADMIN_UNSUPPORTED_HASH",
-                    format!("Unsupported hash algorithm: {}", hash),
-                ),
+                    _ => AdminResponse::error(
+                        "ADMIN_UNSUPPORTED_HASH",
+                        format!("Unsupported hash algorithm: {}", hash),
+                    ),
+                },
+                None => AdminResponse::error("ADMIN_LOCKED", "Kunci server keys are locked"),
             }
         }
         AdminRequest::BackupKeys {
@@ -1211,20 +1335,45 @@ async fn handle_admin_client(
             fido2_metadata_file,
             fido2_device,
             fido2_pin_file,
-        } => match encrypted_backup_artifact(
-            &state.tang_server,
-            &backend,
-            if wrapping_key_file.is_empty() {
-                None
-            } else {
-                Some(FsPath::new(&wrapping_key_file))
+        } => match state.tang_server.read().await.clone() {
+            Some(tang_server) => match encrypted_backup_artifact(
+                &tang_server,
+                &backend,
+                if wrapping_key_file.is_empty() {
+                    None
+                } else {
+                    Some(FsPath::new(&wrapping_key_file))
+                },
+                fido2_metadata_file.as_deref().map(FsPath::new),
+                fido2_device,
+                fido2_pin_file.as_deref().map(FsPath::new),
+            ) {
+                Ok(artifact) => AdminResponse::ok_backup(artifact),
+                Err(err) => AdminResponse::error("ADMIN_BACKUP_FAILED", err.to_string()),
             },
+            None => AdminResponse::error("ADMIN_LOCKED", "Kunci server keys are locked"),
+        },
+        AdminRequest::UnlockKeys {
+            backend,
+            wrapping_key_file,
+            fido2_metadata_file,
+            fido2_device,
+            fido2_pin_file,
+            backup,
+        } => match unlock_tang_server(
+            &state.config,
+            backend.as_deref(),
+            wrapping_key_file.as_deref().map(FsPath::new),
             fido2_metadata_file.as_deref().map(FsPath::new),
             fido2_device,
             fido2_pin_file.as_deref().map(FsPath::new),
+            backup.as_deref(),
         ) {
-            Ok(artifact) => AdminResponse::ok_backup(artifact),
-            Err(err) => AdminResponse::error("ADMIN_BACKUP_FAILED", err.to_string()),
+            Ok(tang_server) => {
+                let (key_count, signing_key_count) = state.replace_server(tang_server).await;
+                AdminResponse::ok_unlocked(key_count, signing_key_count)
+            }
+            Err(err) => AdminResponse::error("ADMIN_UNLOCK_FAILED", err.to_string()),
         },
     };
 
@@ -1319,19 +1468,28 @@ async fn main() -> Result<()> {
     info!("Key directory: {:?}", config.directory);
     info!("Key backend: {:?}", config.key_backend);
     info!("Allow TOFU: {}", config.allow_tofu);
-    // Create Tang server instance
-    let tang_server = load_tang_server(&config)?;
-    let exchange_keys: Vec<String> = tang_server
-        .key_store()
-        .keys
-        .iter()
-        .filter(|jwk| jwk.has_op("deriveKey") && jwk.alg() == Some("ECMR"))
-        .filter_map(|jwk| jwk.thumbprint("S256").ok())
-        .collect();
-    info!("Exchange key thumbprints: {:?}", exchange_keys);
-    let state = AppState {
-        tang_server: Arc::new(tang_server),
+    let tang_server = match load_tang_server(&config) {
+        Ok(tang_server) => {
+            let exchange_keys: Vec<String> = tang_server
+                .key_store()
+                .keys
+                .iter()
+                .filter(|jwk| jwk.has_op("deriveKey") && jwk.alg() == Some("ECMR"))
+                .filter_map(|jwk| jwk.thumbprint("S256").ok())
+                .collect();
+            info!("Exchange key thumbprints: {:?}", exchange_keys);
+            Some(tang_server)
+        }
+        Err(err) if config.admin_sock.is_some() => {
+            warn!(
+                "Key backend is locked or unavailable; starting HTTP service in locked mode: {}",
+                err
+            );
+            None
+        }
+        Err(err) => return Err(err),
     };
+    let state = AppState::new(config.clone(), tang_server);
 
     if let Some(admin_sock) = config.admin_sock.clone() {
         let admin_gid = config
@@ -1442,6 +1600,13 @@ mod tests {
                 .map(|ops| ops.iter().any(|op| op == "deriveKey"))
                 .unwrap_or(false),
             _ => false,
+        }
+    }
+
+    fn test_server_config(directory: &FsPath) -> ServerConfig {
+        ServerConfig {
+            directory: directory.to_path_buf(),
+            ..ServerConfig::default()
         }
     }
 
@@ -1740,10 +1905,14 @@ mod tests {
     async fn start_test_server() -> TestServer {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = TangConfig::new(tempdir.path().to_string_lossy().into_owned());
-        let tang_server = Arc::new(TangServer::new(config).expect("tang server"));
-        let state = AppState {
-            tang_server: tang_server.clone(),
-        };
+        let tang_server = TangServer::new(config).expect("tang server");
+        let state = AppState::new(test_server_config(tempdir.path()), Some(tang_server));
+        let tang_server = state
+            .tang_server
+            .read()
+            .await
+            .clone()
+            .expect("loaded test server");
 
         let router = create_router(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -1845,8 +2014,8 @@ mod tests {
     async fn test_admin_socket_rejects_wrong_gid() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = TangConfig::new(tempdir.path().to_string_lossy().into_owned());
-        let tang_server = Arc::new(TangServer::new(config).expect("tang server"));
-        let state = AppState { tang_server };
+        let tang_server = TangServer::new(config).expect("tang server");
+        let state = AppState::new(test_server_config(tempdir.path()), Some(tang_server));
 
         let (client, server) = UnixStream::pair().expect("pair");
         let allowed_gid = nix::unistd::getgid().as_raw().saturating_add(1);
@@ -1871,8 +2040,8 @@ mod tests {
     async fn test_admin_socket_returns_keys() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = TangConfig::new(tempdir.path().to_string_lossy().into_owned());
-        let tang_server = Arc::new(TangServer::new(config).expect("tang server"));
-        let state = AppState { tang_server };
+        let tang_server = TangServer::new(config).expect("tang server");
+        let state = AppState::new(test_server_config(tempdir.path()), Some(tang_server));
 
         let (client, server) = UnixStream::pair().expect("pair");
         let allowed_gid = nix::unistd::getgid().as_raw();
@@ -1908,10 +2077,14 @@ mod tests {
         let key_file = tempfile::NamedTempFile::new().expect("key file");
         std::fs::write(key_file.path(), [44u8; 32]).expect("write key");
         let config = TangConfig::new(tempdir.path().to_string_lossy().into_owned());
-        let tang_server = Arc::new(TangServer::new(config).expect("tang server"));
-        let state = AppState {
-            tang_server: tang_server.clone(),
-        };
+        let tang_server = TangServer::new(config).expect("tang server");
+        let state = AppState::new(test_server_config(tempdir.path()), Some(tang_server));
+        let tang_server = state
+            .tang_server
+            .read()
+            .await
+            .clone()
+            .expect("loaded test server");
 
         let (client, server) = UnixStream::pair().expect("pair");
         let allowed_gid = nix::unistd::getgid().as_raw();
@@ -1948,6 +2121,100 @@ mod tests {
             restored.signing_key_count(),
             tang_server.key_store().signing_key_count()
         );
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admin_socket_reports_locked_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new(test_server_config(tempdir.path()), None);
+
+        let (client, server) = UnixStream::pair().expect("pair");
+        let allowed_gid = nix::unistd::getgid().as_raw();
+
+        let server_task = tokio::spawn(async move {
+            handle_admin_client(server, allowed_gid, state)
+                .await
+                .unwrap();
+        });
+
+        let request = AdminRequest::ShowKeys {
+            hash: "S256".to_string(),
+        };
+        let (mut read_half, mut write_half) = client.into_split();
+        write_half
+            .write_all(&serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        drop(write_half);
+
+        let mut resp_bytes = Vec::new();
+        read_half.read_to_end(&mut resp_bytes).await.unwrap();
+        let response: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.code.as_deref(), Some("ADMIN_LOCKED"));
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_admin_socket_unlocks_from_encrypted_backup() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let key_file = tempfile::NamedTempFile::new().expect("key file");
+        std::fs::write(key_file.path(), [45u8; 32]).expect("write key");
+        let config = TangConfig::new(tempdir.path().to_string_lossy().into_owned());
+        let tang_server = TangServer::new(config).expect("tang server");
+        let backup = encrypted_backup_artifact(
+            &tang_server,
+            "raw-file",
+            Some(key_file.path()),
+            None,
+            None,
+            None,
+        )
+        .expect("backup artifact");
+        let state = AppState::new(test_server_config(tempdir.path()), None);
+        let state_after = state.clone();
+
+        let (client, server) = UnixStream::pair().expect("pair");
+        let allowed_gid = nix::unistd::getgid().as_raw();
+
+        let server_task = tokio::spawn(async move {
+            handle_admin_client(server, allowed_gid, state)
+                .await
+                .unwrap();
+        });
+
+        let request = AdminRequest::UnlockKeys {
+            backend: Some("raw-file".to_string()),
+            wrapping_key_file: Some(key_file.path().to_string_lossy().into_owned()),
+            fido2_metadata_file: None,
+            fido2_device: None,
+            fido2_pin_file: None,
+            backup: Some(backup),
+        };
+        let (mut read_half, mut write_half) = client.into_split();
+        write_half
+            .write_all(&serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        drop(write_half);
+
+        let mut resp_bytes = Vec::new();
+        read_half.read_to_end(&mut resp_bytes).await.unwrap();
+        let response: AdminResponse = serde_json::from_slice(&resp_bytes).unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            response.unlocked,
+            Some(kunci_core::admin::AdminUnlockStatus {
+                key_count: 2,
+                signing_key_count: 1,
+            })
+        );
+        let loaded = state_after.loaded_server().await.expect("loaded server");
+        assert_eq!(loaded.key_store().key_count(), 2);
+        assert_eq!(loaded.key_store().signing_key_count(), 1);
 
         server_task.await.unwrap();
     }
