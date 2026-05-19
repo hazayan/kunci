@@ -1,1 +1,2 @@
 .beads/issues.jsonl filter=git-crypt diff=git-crypt
+.beads/interactions.jsonl filter=git-crypt diff=git-crypt
