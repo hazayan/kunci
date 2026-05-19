@@ -19,3 +19,5 @@
 [00019] [2026-05-19T03:21:11Z] [TROUBLESHOOTING] Rechecked the FIDO2-backed restore drill prerequisites on local, PrimaryHost, and BackupHost; both trust hosts are reachable and have kunci-client installed, but no FIDO2 authenticator is visible yet.
 [00020] [2026-05-19T14:02:03Z] [SECURITY] Added a repeatable JJ and git-crypt repair helper so Beads metadata is committed through Git clean filters, imported into JJ without rewriting the working tree, and verified against the committed encrypted blob.
 [00021] [2026-05-19T15:55:07Z] [VALIDATION] Completed the Kunci restore drill on BackupHost with a FIDO2-encrypted artifact, fresh FIDO2-backed restored keystore, unlock-test validation, and a real Tang client encrypt/decrypt round trip through the restored server.
+[00022] [2026-05-19T22:05:00Z] [FIX] Normalized kunci-client decrypt input so flattened JWE JSON, wrapped {"jwe":"<compact>"} JSON, and JSON string compact JWE inputs are accepted at the CLI boundary.
+[00023] [2026-05-19T22:05:00Z] [VALIDATION] Added Kunci client regression coverage for JWE input normalization and verified kunci-client plus core JWE conversion tests.

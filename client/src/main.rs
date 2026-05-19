@@ -412,6 +412,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         format!("Invalid JSON: {}", e),
                     )
                 })?;
+            let ciphertext = normalize_decrypt_ciphertext(ciphertext)?;
 
             // Decrypt
             let plaintext = pin_instance.decrypt(&config_json, &ciphertext)?;
@@ -624,6 +625,36 @@ fn normalize_config(json: serde_json::Value) -> serde_json::Value {
     json
 }
 
+fn normalize_decrypt_ciphertext(
+    ciphertext: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    if is_flattened_jwe(&ciphertext) {
+        return Ok(ciphertext);
+    }
+
+    if let Some(compact) = ciphertext.get("jwe").and_then(|value| value.as_str()) {
+        return compact_jwe_to_value(compact);
+    }
+
+    if let Some(compact) = ciphertext.as_str() {
+        return compact_jwe_to_value(compact);
+    }
+
+    Ok(ciphertext)
+}
+
+fn compact_jwe_to_value(compact: &str) -> Result<serde_json::Value, Box<dyn Error>> {
+    let jwe_json = kunci_core::zfs::convert_jwe_compact_to_json(compact)?;
+    serde_json::from_str(&jwe_json).map_err(Into::into)
+}
+
+fn is_flattened_jwe(value: &serde_json::Value) -> bool {
+    value.get("protected").is_some()
+        && value.get("iv").is_some()
+        && value.get("ciphertext").is_some()
+        && value.get("tag").is_some()
+}
+
 fn apply_trust_flag(
     config_json: serde_json::Value,
     pin: &str,
@@ -834,7 +865,7 @@ fn write_output(output: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_trust_flag, normalize_config};
+    use super::{apply_trust_flag, normalize_config, normalize_decrypt_ciphertext};
     use kunci_core::admin::AdminUnlockStatus;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -892,6 +923,61 @@ mod tests {
         let cfg = json!({ "pin": "sss" });
         let err = apply_trust_flag(cfg, "sss", true).unwrap_err();
         assert!(err.to_string().contains("only supported"));
+    }
+
+    #[test]
+    fn test_normalize_decrypt_ciphertext_preserves_flattened_jwe() {
+        let jwe = json!({
+            "protected": "header",
+            "encrypted_key": "",
+            "iv": "iv",
+            "ciphertext": "ciphertext",
+            "tag": "tag"
+        });
+
+        let normalized = normalize_decrypt_ciphertext(jwe.clone()).unwrap();
+        assert_eq!(normalized, jwe);
+    }
+
+    #[test]
+    fn test_normalize_decrypt_ciphertext_accepts_wrapped_compact_jwe() {
+        let compact = "header..iv.ciphertext.tag";
+        let normalized = normalize_decrypt_ciphertext(json!({ "jwe": compact })).unwrap();
+
+        assert_eq!(
+            normalized.get("protected").and_then(|value| value.as_str()),
+            Some("header")
+        );
+        assert_eq!(
+            normalized
+                .get("encrypted_key")
+                .and_then(|value| value.as_str()),
+            Some("")
+        );
+        assert_eq!(
+            normalized.get("iv").and_then(|value| value.as_str()),
+            Some("iv")
+        );
+        assert_eq!(
+            normalized
+                .get("ciphertext")
+                .and_then(|value| value.as_str()),
+            Some("ciphertext")
+        );
+        assert_eq!(
+            normalized.get("tag").and_then(|value| value.as_str()),
+            Some("tag")
+        );
+    }
+
+    #[test]
+    fn test_normalize_decrypt_ciphertext_accepts_json_string_compact_jwe() {
+        let normalized = normalize_decrypt_ciphertext(json!("header..iv.ciphertext.tag")).unwrap();
+
+        assert_eq!(
+            normalized.get("protected").and_then(|value| value.as_str()),
+            Some("header")
+        );
     }
 
     #[tokio::test]
