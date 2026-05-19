@@ -16,3 +16,4 @@
 [00016] [2026-05-16T19:53:50Z] [TROUBLESHOOTING] Prepared a fido2-enabled kunci build for the restore drill and recorded that hardware validation is blocked until a FIDO2 authenticator is visible on the local or backup trust host.
 [00017] [2026-05-19T02:01:48Z] [ISSUE] Tracked the missing peer-mediated server unlock API needed for Kha trust-services clusters to unlock a restarted peer from an already-live cluster member.
 [00018] [2026-05-19T02:22:40Z] [IMPLEMENTATION] Added locked-mode kunci-server startup and a local admin unlock command that can load server keys from the configured backend or an encrypted backup artifact.
+[00019] [2026-05-19T03:21:11Z] [TROUBLESHOOTING] Rechecked the FIDO2-backed restore drill prerequisites on local, PrimaryHost, and BackupHost; both trust hosts are reachable and have kunci-client installed, but no FIDO2 authenticator is visible yet.
