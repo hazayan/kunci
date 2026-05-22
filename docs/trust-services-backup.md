@@ -73,24 +73,26 @@ The restore drill is complete only when a restored `kunci-server` can answer a
 client decrypt/unlock flow against a test binding. A bundle restore that merely
 creates files is not enough evidence.
 
-## Validated Drill Notes
+## Example Drill Notes
 
-The BackupHost restore-host drill completed successfully on 2026-05-19.
+An end-to-end restore-host drill completed successfully on a backup-test host.
 
 Observed flow:
 
-1. Exported the live PrimaryHost key store through `/var/run/kunci-admin.sock` as an
+1. Exported the live primary key store through the local admin socket as an
    encrypted temporary raw-file transport artifact.
-2. Restored that artifact into an isolated encrypted-bundle directory on BackupHost.
-3. Started an isolated BackupHost `kunci-server` from that restored bundle.
-4. Re-exported the restored keys on BackupHost as a FIDO2-encrypted backup artifact
-   using `/etc/kunci/fido2-credential.json` and the attached authenticator.
-5. Restored that FIDO2 artifact into a fresh BackupHost FIDO2-backed key directory.
+2. Restored that artifact into an isolated encrypted-bundle directory on the
+   backup-test host.
+3. Started an isolated backup-test `kunci-server` from that restored bundle.
+4. Re-exported the restored keys on the backup-test host as a FIDO2-encrypted
+   backup artifact using a local credential metadata file and the attached
+   authenticator.
+5. Restored that FIDO2 artifact into a fresh FIDO2-backed key directory.
 6. Verified `kunci-server key unlock-test` against the fresh restored directory.
 7. Started an isolated restored server on `127.0.0.1` and completed a client
    Tang encrypt/decrypt round trip against a drill payload.
 8. Removed temporary raw wrapping keys, temporary artifacts, and isolated server
-   directories from PrimaryHost, BackupHost, and the operator workstation.
+   directories from the primary, backup-test host, and operator workstation.
 
 Backup material required for a real restore:
 
