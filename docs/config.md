@@ -80,7 +80,8 @@ The `kunci` client accepts `--trust` for tang/remote pins and injects `"trust": 
 
 ## Admin Socket
 
-Admin commands (e.g., `show-keys`) use a local Unix socket and require the server to be configured with:
+Admin commands (`show-keys`, `backup-keys`, and `unlock-keys`) use a local
+Unix socket and require the server to be configured with:
 
 ```
 kunci-server --admin-sock /var/run/kunci-admin.sock --admin-gid <GID>
@@ -115,6 +116,23 @@ On the client:
 ```
 kunci show-keys --admin-sock /var/run/kunci-admin.sock --hash S256
 ```
+
+If an encrypted key backend cannot be unlocked during server startup, the HTTP
+server remains available in a locked state. Tang advertisement and recovery
+requests return a locked error until the key store is loaded through the admin
+socket:
+
+```
+kunci unlock-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/fido2.pin
+```
+
+`unlock-keys` can also load an encrypted backup artifact directly when paired
+with `--backup` and the matching backup backend options.
 
 ## Server Key Backend
 
@@ -225,10 +243,17 @@ kunci backup-keys \
   --fido2-pin-file /run/kunci/backup-fido2.pin \
   --output tang-keys.kunci-backup
 
-kunci-server key restore \
+kunci-server --key-backend encrypted-bundle key restore \
   --input tang-keys.kunci-backup \
   --directory /var/db/tang-restored \
   --wrapping-key-file /etc/kunci/server-wrap.key
+
+kunci unlock-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/fido2.pin
 ```
 
 The admin backup command asks the running server to encrypt its in-memory key

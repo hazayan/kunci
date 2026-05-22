@@ -53,9 +53,8 @@ to decrypt the artifact, but it is required for the FIDO2 hmac-secret flow.
 The restore target should be a backup trust-services host or a disposable VM:
 
 ```sh
-kunci-server key restore \
+kunci-server --key-backend fido2 key restore \
   --input kunci-server-keys.kunci-backup \
-  --backend fido2 \
   --directory /var/db/kunci-server/keys \
   --fido2-metadata-file /usr/local/etc/kunci/fido2-credential.json \
   --fido2-device auto \

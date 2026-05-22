@@ -38,6 +38,8 @@ socket for operational commands.
 - `encrypt`
 - `decrypt`
 - `show-keys`
+- `backup-keys`
+- `unlock-keys`
 - `zfs bind`
 - `zfs unlock`
 - `zfs unbind`
@@ -88,7 +90,10 @@ kunci show-keys --admin-sock /var/run/kunci-admin.sock --hash S256
 ```
 
 Server key storage can be protected at rest with a FIDO2 authenticator, and
-encrypted backup artifacts can use a distinct FIDO2 credential. See
+encrypted backup artifacts can use a distinct FIDO2 credential. If a configured
+encrypted key backend cannot be unlocked at startup, `kunci-server` can still
+start in a locked state and deny Tang operations until `kunci unlock-keys`
+unlocks the in-memory key store through the local admin socket. See
 [configuration](docs/config.md) and
 [trust services backup](docs/trust-services-backup.md).
 
@@ -99,27 +104,29 @@ Prerequisites:
 - Rust via `rustup`
 - system libraries required by the enabled feature set
 
-Build the main workspace:
+Build the client and server with FIDO2 server-key support:
 
 ```bash
-cargo build --workspace --features=full
+cargo build -p kunci-client -p kunci-server --features kunci-server/fido2
 ```
 
 Run tests:
 
 ```bash
-cargo test --workspace --features=full
+cargo test -p kunci-client -p kunci-server --features kunci-server/fido2
 ```
 
 Build release artifacts:
 
 ```bash
-cargo build --workspace --features=full --release
+cargo build -p kunci-client -p kunci-server --features kunci-server/fido2 --release
 ```
 
 Feature flags:
 
 - `full`: enables the main cryptographic and network dependencies
+- `kunci-server/fido2`: enables FIDO2 hmac-secret server key wrapping and
+  backups in the server package
 - `tpm2`: enables TPM2-specific code paths
 - `yubikey`: enables Yubikey-specific code paths
 
@@ -155,6 +162,29 @@ Unlock a ZFS dataset:
 kunci zfs unlock --dataset zroot/ROOT/default
 ```
 
+Export an encrypted server-key backup through the admin socket:
+
+```bash
+kunci backup-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/backup-fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/backup-fido2.pin \
+  --output tang-keys.kunci-backup
+```
+
+Unlock a locked server key store:
+
+```bash
+kunci unlock-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto \
+  --fido2-pin-file /run/kunci/fido2.pin
+```
+
 ## Repository Layout
 
 ```text
@@ -174,4 +204,4 @@ bsd/       FreeBSD-specific integration material
 
 ## License
 
-Kunci is licensed under the BSD 2-Clause license. See [LICENSE](LICENSE).
+Kunci is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).

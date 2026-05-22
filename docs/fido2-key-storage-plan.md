@@ -1,4 +1,16 @@
-# FIDO2 Server Keystore Plan
+# FIDO2 Server Keystore Design
+
+## Status
+
+This document started as the design plan for FIDO2-protected Kunci server keys.
+The core design is now implemented: `kunci-server` supports `filesystem`,
+`encrypted-bundle`, and `fido2` key backends; server key initialization,
+migration, restore, unlock-test, and FIDO2 enrollment are explicit
+`kunci-server key ...` operations; encrypted admin backups and locked-server
+unlock are available through the local admin socket.
+
+The remaining value of this document is architectural context and future
+hardening notes.
 
 ## Goal
 
@@ -8,7 +20,7 @@ authenticator connected to the machine running the server.
 This is server-side key storage only. It does not change the client unlock
 flow, the bootloader, booster, zhamel, or ZFS dataset binding format.
 
-## Current Server Key Flow
+## Server Key Flow
 
 `kunci-server` currently loads a `KeyStore` from a filesystem directory through
 `KeyStore::load()` in `core/src/keys.rs`. The store contains:
@@ -37,7 +49,7 @@ So the practical and clean design is a FIDO-protected keystore backend: Tang
 JWKs remain Tang JWKs, but they are encrypted at rest and are only unwrapped
 when the local authenticator derives the keystore wrapping key.
 
-## Proposed Backend
+## Backend Model
 
 Add a keystore abstraction under `core/src/keys.rs`:
 
@@ -49,11 +61,13 @@ trait ServerKeyBackend {
 }
 ```
 
-Initial implementations:
+Implemented backends:
 
 - `FilesystemKeyBackend`: current behavior, plain JWK files in a directory.
-- `Fido2WrappedFilesystemKeyBackend`: encrypted JWK bundle or encrypted JWK
-  files on disk, unwrapped via a local FIDO2 authenticator at server startup.
+- `EncryptedBundleKeyBackend<RawFileWrappingKeyProvider>`: encrypted JWK bundle
+  protected by a raw 32-byte wrapping key file.
+- `EncryptedBundleKeyBackend<Fido2WrappingKeyProvider>`: encrypted JWK bundle
+  protected by a local FIDO2 authenticator at server startup or admin unlock.
 
 This keeps Tang protocol code unchanged and isolates storage policy from
 advertisement/recovery logic.
@@ -87,7 +101,7 @@ Metadata to store:
 ```json
 {
   "version": 1,
-  "backend": "fido2-wrapped-filesystem",
+  "backend": "fido2",
   "rp_id": "kunci-server.local",
   "credential_id": "base64url...",
   "salt": "base64url-32-bytes",
@@ -127,41 +141,71 @@ Server config:
 
 ```json
 {
-  "key_backend": "fido2-wrapped-filesystem",
+  "key_backend": "fido2",
   "directory": "/var/db/tang",
   "fido2": {
-    "rp_id": "kunci-server.local",
+    "metadata_file": "/etc/kunci/fido2-credential.json",
     "device": "auto",
-    "uv": "discouraged",
-    "up": true
+    "pin_file": "/run/kunci/fido2.pin"
   }
 }
 ```
 
-Suggested admin commands:
+Implemented admin commands:
 
 ```sh
-kunci-server key init --backend fido2 --directory /var/db/tang --device auto
-kunci-server key migrate --from filesystem --to fido2 --directory /var/db/tang
-kunci-server key unlock-test --directory /var/db/tang
-kunci-server key rotate --directory /var/db/tang
+kunci-server key fido2-enroll \
+  --metadata-file /etc/kunci/fido2-credential.json \
+  --device auto
+
+kunci-server key init \
+  --backend fido2 \
+  --directory /var/db/tang \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto
+
+kunci-server key migrate \
+  --from filesystem \
+  --to fido2 \
+  --source-directory /var/db/tang.plain \
+  --directory /var/db/tang \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto
+
+kunci-server key unlock-test \
+  --backend fido2 \
+  --directory /var/db/tang \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto
+
 kunci show-keys --admin-sock /var/run/kunci-admin.sock
-kunci backup-keys --admin-sock /var/run/kunci-admin.sock --backend fido2 --output tang-keys.kunci-backup
+
+kunci backup-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/backup-fido2-credential.json \
+  --fido2-device auto \
+  --output tang-keys.kunci-backup
+
+kunci unlock-keys \
+  --admin-sock /var/run/kunci-admin.sock \
+  --backend fido2 \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto
 ```
 
-Exact CLI placement can be adjusted to the existing server/client split. The
-important behavior is that initialization and migration are explicit operations,
-not implicit side effects of normal server start.
+Initialization and migration are explicit operations, not implicit side effects
+of normal server start.
 
 ## Admin Backup Command
 
 Encrypted backup is in scope for the same server-key management feature. It is
 not a separate protocol feature and should not change the Tang client-facing API.
 
-The current admin socket only supports `show_keys`. Extend that local privileged
-path with a `backup_keys` request that asks the running `kunci-server` to export
-its in-memory `KeyStore` as an encrypted backup artifact. The client writes that
-artifact to the requested storage path.
+The admin socket supports `show_keys`, `backup_keys`, and `unlock_keys`.
+`backup_keys` asks the running `kunci-server` to export its in-memory `KeyStore`
+as an encrypted backup artifact. The client writes that artifact to the
+requested storage path.
 
 Important boundary: the admin command should not return plaintext JWKs. It
 should return only an encrypted bundle plus metadata. If we ever need plaintext
@@ -182,40 +226,31 @@ bundle format as the server keystore backend, but it should support an
 independent FIDO2 credential and salt. That avoids coupling the operational
 server-start token to the off-host backup token.
 
-Suggested backup artifact shape:
+Current backup artifact shape:
 
 ```json
 {
   "version": 1,
   "kind": "kunci-server-key-backup",
-  "created_at": "2026-05-05T00:00:00Z",
-  "source": {
-    "signing_thumbprints": ["..."],
-    "exchange_thumbprints": ["..."]
-  },
-  "encryption": {
-    "backend": "fido2-wrapped-backup",
-    "metadata": {
-      "rp_id": "kunci-server-backup.local",
-      "credential_id": "base64url...",
-      "salt": "base64url-32-bytes",
-      "uv": "discouraged",
-      "up": true,
-      "kdf": {
-        "type": "hkdf-sha256",
-        "info": "kunci server key backup fido2 v1"
-      },
-      "cipher": "A256GCM"
-    }
-  },
+  "cipher": "A256GCM",
+  "nonce": "base64url...",
   "ciphertext": "base64url..."
 }
 ```
 
-Restore should also be explicit:
+The wrapping backend metadata, such as the backup FIDO2 credential metadata,
+lives outside the artifact and must be preserved with the restore procedure.
+
+Restore should also be explicit. `key restore` uses the configured/global
+destination backend, so pass `--key-backend` or use a config file that selects
+the destination backend:
 
 ```sh
-kunci-server key restore --input tang-keys.kunci-backup --directory /var/db/tang
+kunci-server --key-backend fido2 key restore \
+  --input tang-keys.kunci-backup \
+  --directory /var/db/tang \
+  --fido2-metadata-file /etc/kunci/fido2-credential.json \
+  --fido2-device auto
 ```
 
 Restoring should validate that the backup contains at least one signing key and
@@ -272,16 +307,18 @@ Builder/IaC packages to track:
    - validate touch timeout and PIN/UV policy
 8. Test on Linux first, then FreeBSD.
 
-## Implementation Steps
+## Implementation Status
 
-1. Introduce a storage backend abstraction without changing Tang protocol code.
-2. Move current filesystem loading into `FilesystemKeyBackend`.
-3. Add encrypted bundle serialization/deserialization for `KeyStore`.
-4. Add fake FIDO2 backend and tests.
-5. Add libfido2 backend behind a `fido2` feature.
-6. Add explicit init/migrate/unlock-test commands.
-7. Extend the admin protocol with encrypted `backup_keys` and explicit restore
-   commands.
-8. Run real-device validation.
-9. Update `foji-bsd`, `foji-artix`, and builder IaC notes with libfido2
-   dependencies once the real-device path is proven.
+Completed:
+
+1. Storage backend abstraction without changing Tang protocol code.
+2. Filesystem backend extraction.
+3. Encrypted bundle serialization/deserialization for `KeyStore`.
+4. FIDO2 hmac-secret wrapping provider and feature flag.
+5. Explicit init, migrate, unlock-test, restore, and fido2-enroll commands.
+6. Encrypted `backup_keys` and `unlock_keys` admin socket operations.
+7. Real-device validation for FIDO2-backed migration, unlock-test, backup, and
+   restore.
+
+Future work remains around key rotation through the backend abstraction and
+broader cross-platform hardware validation.
