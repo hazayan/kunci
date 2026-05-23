@@ -1,8 +1,8 @@
 # Trust Services Backup
 
-`kunci-server` may run on the same trust-services host as Knox. Sharing the
+`kunci-server` may run on the same trust-services host as OpenBao. Sharing the
 same physical authenticator is operationally useful, but each service must use
-separate FIDO2 credentials and metadata.
+separate unlock material, credentials, and metadata.
 
 Recommended primary host layout:
 
@@ -11,13 +11,14 @@ identity-primary
   kunci-server
     /usr/local/etc/kunci/fido2-credential.json
     /var/db/kunci-server/keys
-  knox-server
-    /usr/local/etc/knox/fido2-credential.json
-    /var/db/knox
+  openbao
+    /usr/local/etc/openbao/openbao.hcl
+    /var/db/openbao
 ```
 
-The same physical authenticator may hold both credentials, but kunci and Knox
-should not share RP IDs, salts, metadata files, or backup credentials.
+The same physical authenticator may participate in both unlock ceremonies, but
+Kunci and OpenBao should not share RP IDs, salts, metadata files, unseal
+material, or backup credentials.
 
 ## Kunci Backup
 

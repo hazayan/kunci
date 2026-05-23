@@ -18,3 +18,4 @@
 [00018] [2026-05-19T15:55:07Z] [VALIDATION] Completed the Kunci restore drill on a backup-test host with a FIDO2-encrypted artifact, fresh FIDO2-backed restored keystore, unlock-test validation, and a real Tang client encrypt/decrypt round trip through the restored server.
 [00019] [2026-05-19T22:05:00Z] [FIX] Normalized kunci-client decrypt input so flattened JWE JSON, wrapped {"jwe":"<compact>"} JSON, and JSON string compact JWE inputs are accepted at the CLI boundary.
 [00020] [2026-05-19T22:05:00Z] [VALIDATION] Added Kunci client regression coverage for JWE input normalization and verified kunci-client plus core JWE conversion tests.
+[00021] [2026-05-23T23:09:00Z] [DOCUMENTATION] Updated trust-services backup notes to describe OpenBao as the colocated secret service and removed active Knox deployment guidance.
