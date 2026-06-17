@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "kunci",
-  "project_id": "95dac8c0-c715-48c6-b124-48a9e6de3efc"
-}
