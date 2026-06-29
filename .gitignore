@@ -9,6 +9,3 @@ corpus/
 .dolt/
 *.db
 .beads-credential-key
-AGENTS.md
-CLAUDE.md
-.claude/
